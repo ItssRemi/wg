@@ -2501,38 +2501,63 @@ class Waifugami(AuditMixin, commands.Cog):
         )
 
     async def _send_channel_v2_components(
-        self, channel: Any, components: List[Dict[str, Any]],
+        self,
+        channel: Any,
+        components: List[Dict[str, Any]],
         reference_message_id: Optional[int] = None,
     ) -> Any:
-        # Discord requires every Components V2 container (type 17) to have
-        # between 1 and 40 child components. Some callers, such as the audit
-        # review view, can legitimately produce an empty component list when
-        # there is nothing to display.
         if not components:
             components = [{
                 "type": 10,
                 "content": "Nothing to display.",
             }]
 
-        # Keep the payload valid if a caller accidentally exceeds Discord's
-        # 40-child limit. This helper is also used by dynamically generated
-        # views, so enforce the API constraint at the final boundary.
-        components = components[:40]
+        # Discord's Components V2 total component limit is 40.
+        # The type 17 container counts as one, so it can contain at most
+        # 39 child components.
+        MAX_CHILD_COMPONENTS = 39
 
-        payload: Dict[str, Any] = {
-            "flags": V2_FLAG,
-            "allowed_mentions": {"parse": []},
-            "components": [{"type": 17, "components": components}],
-        }
-        if reference_message_id:
-            payload["message_reference"] = {
-                "message_id": str(reference_message_id),
-                "channel_id": str(channel.id),
-                "guild_id": str(channel.guild.id),
-                "fail_if_not_exists": False,
+        chunks = [
+            components[i:i + MAX_CHILD_COMPONENTS]
+            for i in range(0, len(components), MAX_CHILD_COMPONENTS)
+        ]
+
+        log.debug(
+            "Sending V2 components: %s total child components, %s messages required",
+            len(components),
+            len(chunks),
+        )
+
+        route = Route(
+            "POST",
+            "/channels/{channel_id}/messages",
+            channel_id=channel.id,
+        )
+
+        responses = []
+
+        for index, chunk in enumerate(chunks):
+            payload: Dict[str, Any] = {
+                "flags": V2_FLAG,
+                "allowed_mentions": {"parse": []},
+                "components": [{
+                    "type": 17,
+                    "components": chunk,
+                }],
             }
-        route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
-        return await self.bot.http.request(route, json=payload)
+
+            if reference_message_id:
+                payload["message_reference"] = {
+                    "message_id": str(reference_message_id),
+                    "channel_id": str(channel.id),
+                    "guild_id": str(channel.guild.id),
+                    "fail_if_not_exists": False,
+                }
+
+            response = await self.bot.http.request(route, json=payload)
+            responses.append(response)
+
+        return responses[-1] if responses else None
 
     async def _send_quest_wait_button(
         self, channel: Any, user_id: int, board_message_id: int
