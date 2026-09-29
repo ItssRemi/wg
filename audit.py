@@ -16,7 +16,8 @@ from redbot.core import commands
 
 from .audit_engine import (
     KEEP, REVIEW, SELL, UNKNOWN,
-    REASON_LOCKED, REASON_EVENT, REASON_SIGMA, REASON_SERIES_LAST, REASON_SERIES_PROTECTED,
+    REASON_LOCKED, REASON_EVENT, REASON_SIGMA,
+    REASON_SERIES_KEEP, REASON_SERIES_SELL, REASON_SERIES_UNREVIEWED,
     REASON_HIGH_STATS, REASON_OMEGA, REASON_HIGH_VALUE,
     REASON_NEAR_THRESHOLD, REASON_NO_STATS,
     RARITY_DP, OMEGA_SHARDS_PER_CARD, OMEGA_SYMBOLS,
@@ -27,6 +28,7 @@ from .audit_engine import (
     WAIFUGAMI_ID, V2_FLAG,
     classify_cards, _chunk, _is_locked, _skill, _luck,
     _rarity_symbol, _dp_for_card, _shards_for_card,
+    _card_identity, _normalise_card_name, _series_id_for,
 )
 
 def _normalise_card_name(name: str) -> str:
@@ -59,7 +61,7 @@ class AuditSession:
         "user_id", "channel_id", "guild_id",
         "phase",               # "harvesting" | "classified" | "confirming" | "executing"
         "list_message_id",     # Waifugami's .l -event all message id
-        "event_cards",         # Set[int] — accumulated across all pages
+        "event_cards",         # Dict[str, Dict[str, Any]] — identity → snapshot, accumulated across all pages
         "seen_pages",          # Set[int]
         "total_pages",         # int | None
         "classified",          # List[dict] — output of classify_cards()
@@ -145,15 +147,16 @@ class AuditMixin:
         return [c for c in cards.values() if c.get("status") == "active"]
 
     async def _audit_protection(self, user_id: int) -> Dict[str, Any]:
-        data = await self.config.user_from_id(user_id).audit_protection()
+        """Load the full persistent audit protection record for a user.
 
+        Always returns a dict with all three top-level keys present.
+        """
+        data = await self.config.user_from_id(user_id).audit_protection()
         if not isinstance(data, dict):
             data = {}
-
         data.setdefault("event_cards", {})
-        data.setdefault("sigma_cards", {})
+        data.setdefault("sigma_cards", {})       # separate store — intent is explicit
         data.setdefault("protected_series", {})
-
         return data
 
     async def _save_audit_protection(
@@ -168,39 +171,54 @@ class AuditMixin:
         user_id: int,
         cards: Dict[str, Dict[str, Any]],
     ) -> None:
+        """Persist event-card identities learned during a scan.
+
+        Each call is additive — previously learned cards are never deleted.
+
+        Sigma cards (rarity == σ) are written into their OWN dedicated store
+        (sigma_cards) in addition to event_cards.  This keeps Sigma protection
+        alive and semantically clear even if the card later leaves the event
+        list, because sigma_cards is never pruned.
+        """
         if not cards:
             return
 
-        protection = await self._audit_protection(user_id)
-        event_cards = protection["event_cards"]
-        sigma_cards = protection["sigma_cards"]
+        protection   = await self._audit_protection(user_id)
+        event_cards  = protection["event_cards"]
+        sigma_cards  = protection["sigma_cards"]
 
         for identity, snapshot in cards.items():
             existing = event_cards.get(identity)
 
             if existing:
                 merged = dict(existing)
-
                 if snapshot.get("last_seen_id") is not None:
                     merged["last_seen_id"] = snapshot["last_seen_id"]
-
                 if snapshot.get("global_id") is not None:
                     merged["global_id"] = snapshot["global_id"]
-
-                merged["name"] = snapshot["name"]
-                merged["rarity"] = snapshot["rarity"]
+                merged["name"]         = snapshot["name"]
+                merged["rarity"]       = snapshot["rarity"]
                 merged["last_seen_at"] = snapshot["last_seen_at"]
-
-                event_cards[identity] = merged
+                event_cards[identity]  = merged
             else:
                 event_cards[identity] = dict(snapshot)
 
-            if snapshot["rarity"] == "σ":
-                sigma_cards[identity] = dict(event_cards[identity])
+            # Sigma goes into its own store — separate from event_cards so
+            # the protection survives even when the event changes.
+            if str(snapshot.get("rarity", "")).strip().lower() == "σ":
+                existing_sigma = sigma_cards.get(identity, {})
+                merged_sigma   = dict(existing_sigma)
+                merged_sigma.update({
+                    "name":          snapshot["name"],
+                    "rarity":        snapshot["rarity"],
+                    "last_seen_at":  snapshot["last_seen_at"],
+                })
+                if snapshot.get("last_seen_id") is not None:
+                    merged_sigma["last_seen_id"] = snapshot["last_seen_id"]
+                sigma_cards[identity] = merged_sigma
 
         protection["event_cards"] = event_cards
         protection["sigma_cards"] = sigma_cards
-
         await self._save_audit_protection(user_id, protection)
 
     def _enrich_with_catalog(self, cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -218,6 +236,82 @@ class AuditMixin:
                         pass
             enriched.append(c)
         return enriched
+
+    # ── Persistent series review state ────────────────────────────────────
+
+    async def _series_reviews(self, user_id: int) -> Dict[str, Any]:
+        """Return the full protected_series review map for a user."""
+        protection = await self._audit_protection(user_id)
+        return protection.get("protected_series", {})
+
+    async def _save_series_review(
+        self,
+        user_id: int,
+        series_id: str,
+        review: Dict[str, Any],
+    ) -> None:
+        """Persist one series review record immediately (additive write)."""
+        protection = await self._audit_protection(user_id)
+        protection["protected_series"][series_id] = review
+        await self._save_audit_protection(user_id, protection)
+
+    async def _record_series_decision(
+        self,
+        user_id: int,
+        series_id: str,
+        card: Dict[str, Any],
+        decision: str,
+    ) -> None:
+        """Persist a keep/sell decision for one card identity in a series.
+
+        decision must be "keep" or "sell".
+        This is called immediately when the user states a decision — not at
+        the end of the session — so a restart never loses progress.
+        """
+        protection = await self._audit_protection(user_id)
+        series_reviews = protection["protected_series"]
+        review = series_reviews.setdefault(str(series_id), {
+            "status": "in_progress",
+            "decisions": {},
+        })
+        review.setdefault("decisions", {})
+        review.setdefault("status", "in_progress")
+
+        identity = _card_identity(card)
+        review["decisions"][identity] = {
+            "decision":     decision,
+            "name":         card.get("name", "Unknown"),
+            "rarity":       _rarity_symbol(card),
+            "last_seen_id": card.get("local_id"),
+            "decided_at":   time.time(),
+        }
+        protection["protected_series"][str(series_id)] = review
+        await self._save_audit_protection(user_id, protection)
+
+    async def _mark_series_complete(self, user_id: int, series_id: str) -> None:
+        """Mark a series review as complete once all decisions are recorded."""
+        protection = await self._audit_protection(user_id)
+        review = protection["protected_series"].get(str(series_id), {})
+        review["status"] = "complete"
+        protection["protected_series"][str(series_id)] = review
+        await self._save_audit_protection(user_id, protection)
+
+    def _series_needs_review(
+        self,
+        series_id_int: int,
+        series_cards: List[Dict[str, Any]],
+        series_review: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Return the subset of cards that still need a user decision.
+
+        A card needs review if its identity has no decision in the review
+        record, OR if the series has not been started at all.
+        """
+        decisions = series_review.get("decisions", {})
+        return [
+            c for c in series_cards
+            if _card_identity(c) not in decisions
+        ]
 
     # ── Embed parsing (event list pages) ─────────────────────────────────
 
@@ -363,9 +457,14 @@ class AuditMixin:
     async def _audit_event_protection(
         self,
         user_id: int,
-    ) -> Dict[str, Dict[str, Any]]:
+    ) -> tuple:
+        """Return (event_cards, sigma_cards, series_reviews) from persistent store."""
         protection = await self._audit_protection(user_id)
-        return protection.get("event_cards", {})
+        return (
+            protection.get("event_cards", {}),
+            protection.get("sigma_cards", {}),
+            protection.get("protected_series", {}),
+        )
 
     # ── Stage 1b: classify ────────────────────────────────────────────────
 
@@ -387,12 +486,14 @@ class AuditMixin:
             if c.get("local_id") is not None and _is_locked(c)
         }
 
-        event_cards = await self._audit_event_protection(session.user_id)
+        event_cards, sigma_cards, series_reviews = await self._audit_event_protection(session.user_id)
 
         classified = classify_cards(
             enriched,
             session.event_cards,
             event_cards,
+            sigma_cards,
+            series_reviews,
             locked_local_ids,
         )
 
