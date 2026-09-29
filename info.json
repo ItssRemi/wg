@@ -1,0 +1,10 @@
+{
+  "author": ["itsremi", "OpenAI", "Claude"],
+  "description": "Merged Waifugami helper: passive card tracking, team analysis and a Components V2 card browser, plus the spawn-name listener, event pings, series/tier tracking, and catalog maintenance. Formerly two separate cogs (WaifugamiCards and WaifugamiListener), now one cog with every command reachable under `[p]help wg`.",
+  "install_msg": "Loaded Waifugami. Run [p]help wg to see every command. Legacy command names (wgstatus, wgwatch, wgtrack, etc.) still work unchanged.",
+  "short": "Track cards, build teams, and get Waifugami spawn help",
+  "tags": ["waifugami", "cards", "tracking", "teams", "components-v2", "listener", "spawns"],
+  "requirements": [],
+  "min_bot_version": "3.5.0",
+  "end_user_data_statement": "Stores card information and team previews observed in Waifugami messages, pending acquisitions, collection state, the active team number, and the user's card-tracking preference (wg track clear deletes this). Also stores which series a user watches and which character ids a user tracks for completion, plus tier-alert DM subscriptions. Does not store message content beyond what is needed to parse Waifugami's own embeds."
+}
