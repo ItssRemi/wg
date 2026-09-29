@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import discord
 from discord import app_commands
@@ -29,6 +29,29 @@ from .audit_engine import (
     _rarity_symbol, _dp_for_card, _shards_for_card,
 )
 
+def _normalise_card_name(name: str) -> str:
+    return " ".join(str(name).strip().casefold().split())
+
+
+def _card_identity(name: str, rarity: str) -> str:
+    return f"{_normalise_card_name(name)}|{str(rarity).strip().casefold()}"
+
+
+def _card_snapshot(
+    *,
+    local_id: Optional[int],
+    name: str,
+    rarity: str,
+    global_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    return {
+        "name": str(name).strip(),
+        "rarity": str(rarity).strip().lower(),
+        "last_seen_id": int(local_id) if local_id is not None else None,
+        "global_id": int(global_id) if global_id is not None else None,
+        "last_seen_at": time.time(),
+    }
+
 class AuditSession:
     """All mutable state for one user's in-progress audit."""
 
@@ -36,7 +59,7 @@ class AuditSession:
         "user_id", "channel_id", "guild_id",
         "phase",               # "harvesting" | "classified" | "confirming" | "executing"
         "list_message_id",     # Waifugami's .l -event all message id
-        "event_local_ids",     # Set[int] — accumulated across all pages
+        "event_cards",         # Set[int] — accumulated across all pages
         "seen_pages",          # Set[int]
         "total_pages",         # int | None
         "classified",          # List[dict] — output of classify_cards()
@@ -56,7 +79,7 @@ class AuditSession:
         self.guild_id = guild_id
         self.phase = "harvesting"
         self.list_message_id: Optional[int] = None
-        self.event_local_ids: Set[int] = set()
+        self.event_cards: Dict[str, Dict[str, Any]] = {}
         self.seen_pages: Set[int] = set()
         self.total_pages: Optional[int] = None
         self.classified: List[Dict[str, Any]] = []
@@ -120,6 +143,65 @@ class AuditMixin:
     async def _audit_active_cards(self, user_id: int) -> List[Dict[str, Any]]:
         cards = await self.config.user_from_id(user_id).cards()
         return [c for c in cards.values() if c.get("status") == "active"]
+
+    async def _audit_protection(self, user_id: int) -> Dict[str, Any]:
+        data = await self.config.user_from_id(user_id).audit_protection()
+
+        if not isinstance(data, dict):
+            data = {}
+
+        data.setdefault("event_cards", {})
+        data.setdefault("sigma_cards", {})
+        data.setdefault("protected_series", {})
+
+        return data
+
+    async def _save_audit_protection(
+        self,
+        user_id: int,
+        protection: Dict[str, Any],
+    ) -> None:
+        await self.config.user_from_id(user_id).audit_protection.set(protection)
+
+    async def _persist_event_cards(
+        self,
+        user_id: int,
+        cards: Dict[str, Dict[str, Any]],
+    ) -> None:
+        if not cards:
+            return
+
+        protection = await self._audit_protection(user_id)
+        event_cards = protection["event_cards"]
+        sigma_cards = protection["sigma_cards"]
+
+        for identity, snapshot in cards.items():
+            existing = event_cards.get(identity)
+
+            if existing:
+                merged = dict(existing)
+
+                if snapshot.get("last_seen_id") is not None:
+                    merged["last_seen_id"] = snapshot["last_seen_id"]
+
+                if snapshot.get("global_id") is not None:
+                    merged["global_id"] = snapshot["global_id"]
+
+                merged["name"] = snapshot["name"]
+                merged["rarity"] = snapshot["rarity"]
+                merged["last_seen_at"] = snapshot["last_seen_at"]
+
+                event_cards[identity] = merged
+            else:
+                event_cards[identity] = dict(snapshot)
+
+            if snapshot["rarity"] == "σ":
+                sigma_cards[identity] = dict(event_cards[identity])
+
+        protection["event_cards"] = event_cards
+        protection["sigma_cards"] = sigma_cards
+
+        await self._save_audit_protection(user_id, protection)
 
     def _enrich_with_catalog(self, cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fill in series_id from the catalog when the stored card lacks it."""
@@ -235,8 +317,14 @@ class AuditMixin:
         session.touch()
         session.list_message_id = message.id
 
-        for local_id, _rarity, _name in entries:
-            session.event_local_ids.add(local_id)
+        for local_id, rarity, name in entries:
+            identity = _card_identity(name, rarity)
+
+            session.event_cards[identity] = _card_snapshot(
+                local_id=local_id,
+                name=name,
+                rarity=rarity,
+            )
         session.seen_pages.add(page_index)
 
         if total_pages > 0:
@@ -251,7 +339,10 @@ class AuditMixin:
         channel = self.bot.get_channel(session.channel_id)
 
         if all_seen or (total_pages > 0 and page_index == total_pages):
-            # Advance to classification.
+            await self._persist_event_cards(
+                session.user_id,
+                session.event_cards,
+            )
             await self._audit_do_classify(session, channel)
         else:
             # Update the guide message with live progress.
@@ -268,6 +359,13 @@ class AuditMixin:
                     )
                 except discord.HTTPException:
                     pass
+
+    async def _audit_event_protection(
+        self,
+        user_id: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        protection = await self._audit_protection(user_id)
+        return protection.get("event_cards", {})
 
     # ── Stage 1b: classify ────────────────────────────────────────────────
 
@@ -289,8 +387,14 @@ class AuditMixin:
             if c.get("local_id") is not None and _is_locked(c)
         }
 
-        classified = classify_cards(enriched, session.event_local_ids, locked_local_ids)
-        session.classified = classified
+        event_cards = await self._audit_event_protection(session.user_id)
+
+        classified = classify_cards(
+            enriched,
+            session.event_cards,
+            event_cards,
+            locked_local_ids,
+        )
 
         # Summarise by disposition.
         counts = {KEEP: 0, REVIEW: 0, SELL: 0, UNKNOWN: 0}
