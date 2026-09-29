@@ -1,27 +1,4 @@
-"""Waifugami — merged card tracking, team building, and spawn listener cog.
-
-This cog is a structural merge of the former ``WaifugamiCards`` and
-``WaifugamiListener`` cogs. The merge is intentionally behaviour-preserving:
-almost every original function body is unchanged, and every previously
-existing command still works exactly as before, under its original name.
-
-What changed:
-    * Both cogs now live in one Cog class (``Waifugami``) so they load and
-      reload together and can be discovered from a single ``[p]help wg``.
-    * Every command is now reachable as a subcommand of the top-level
-      ``wg`` group (``[p]wg status``, ``[p]wg watch``, ``[p]wg tieralert``,
-      etc.), in addition to its original standalone name/alias, which is
-      kept working unchanged.
-    * The card-tracking toggle group that used to be the bare ``wg`` command
-      (aliases ``wgtrack`` / ``waifugamitrack``) is now primarily reached as
-      ``wg track`` (or the unchanged legacy ``wgtrack`` / ``waifugamitrack``).
-    * Reply-triggered utility commands (``wgupdate``, ``wgscan``) and the
-      right-click "Name" context menu are left exactly as they were, since
-      nesting them under ``wg`` would not make them any easier to use.
-    * ``/wgcards`` and ``/wgcd`` remain standalone slash commands (Discord's
-      slash-command tree is separate from the prefix command tree, so they
-      are unaffected by this refactor).
-
+"""Waifugami — card collection, and team building helper.
 See ``[p]help wg`` for the full merged command list.
 """
 
@@ -770,13 +747,6 @@ class Waifugami(AuditMixin, commands.Cog):
             return None
         refresh = ADVENTURE_REFRESH_RE.search(description)
         rank = match.group(1).upper()
-        # NOTE: previously this looked for the literal text "**Team 1-4**
-        # is adventuring!", but real team names are whatever the player
-        # named them (e.g. "**[⋆˚]** is adventuring!"), so that regex never
-        # actually matched and `.ad` would keep offering team-building
-        # advice even while a team was already out on an active quest.
-        # The presence/absence of "No teams are out on an adventure
-        # currently" is the reliable signal, so derive both fields from it.
         teams_out = "No teams are out on an adventure currently" not in description
         return {
             "state": "current_adventure" if teams_out else "new_quest",
@@ -1265,7 +1235,7 @@ class Waifugami(AuditMixin, commands.Cog):
         if not active:
             # Adventure was started before the bot began tracking (e.g. bot
             # restarted mid-adventure).  Synthesise a minimal record so that
-            # .wgcd shows the remaining time instead of "Not on an adventure".
+            # ..wgcd shows the remaining time instead of "Not on an adventure".
             active = {
                 "adventure_id": f"recovered:{message.guild.id}:{user_id}:{message.id}",
                 "guild_id": message.guild.id,
