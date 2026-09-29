@@ -16,7 +16,7 @@ from redbot.core import commands
 
 from .audit_engine import (
     KEEP, REVIEW, SELL, UNKNOWN,
-    REASON_LOCKED, REASON_EVENT, REASON_SERIES_LAST, REASON_SERIES_PROTECTED,
+    REASON_LOCKED, REASON_EVENT, REASON_SIGMA, REASON_SERIES_LAST, REASON_SERIES_PROTECTED,
     REASON_HIGH_STATS, REASON_OMEGA, REASON_HIGH_VALUE,
     REASON_NEAR_THRESHOLD, REASON_NO_STATS,
     RARITY_DP, OMEGA_SHARDS_PER_CARD, OMEGA_SYMBOLS,
@@ -352,7 +352,7 @@ class AuditMixin:
                     await guide.edit(
                         content=(
                             f"-# Harvesting event cards… "
-                            f"{len(session.event_local_ids)} found so far "
+                            f"{len(session.event_cards)} found so far "
                             f"(page {page_index} of {total_pages or '?'}). "
                             "Keep clicking ➡."
                         )
@@ -406,9 +406,13 @@ class AuditMixin:
                 dp_total += entry["dp_yield"]
                 shard_total += entry["shard_yield"]
 
+        persistent_event_count = len(event_cards)
+
         summary = (
             f"## Audit Report\n"
-            f"-# {len(classified)} cards evaluated  ·  {len(session.event_local_ids)} event IDs harvested\n\n"
+            f"-# {len(classified)} cards evaluated  ·  "
+            f"{len(session.event_cards)} event cards learned this scan  ·  "
+            f"{persistent_event_count} remembered permanently\n\n"
             f"🟢 **KEEP** — `{counts[KEEP]}` cards protected\n"
             f"🟡 **REVIEW** — `{counts[REVIEW]}` cards need your attention\n"
             f"🔴 **SELL** — `{counts[SELL]}` cards ready for removal\n"
@@ -549,17 +553,34 @@ class AuditMixin:
             await ctx.reply("No REVIEW or UNKNOWN cards in this audit.", mention_author=False)
             return
 
-        sections: List[str] = [
-            f"## Review & Unknown Cards\n-# {len(entries)} cards require manual inspection"
-        ]
-        for entry in entries:
+        # Discord allows at most 40 components per message.
+        # Pack card lines into chunks of 20 per section so we never exceed it.
+        CARDS_PER_SECTION = 20
+
+        def _fmt(entry: Dict[str, Any]) -> str:
             skill_str = f"{entry['skill']:.2f}" if entry["skill"] is not None else "?"
             luck_str = str(entry["luck"]) if entry["luck"] is not None else "?"
-            sections.append(
-                f"`{entry['local_id']}` **{entry['name']}** `[{entry['rarity_symbol'].upper()}]`  "
-                f"Skill {skill_str}  Luck {luck_str}\n"
+            return (
+                f"`{entry['local_id']}` **{entry['name']}** "
+                f"`[{entry['rarity_symbol'].upper()}]`  "
+                f"Skill {skill_str}  Luck {luck_str}  "
                 f"-# {entry['disposition']} · {', '.join(entry['reasons'])}"
             )
+
+        header = (
+            f"## Review & Unknown Cards\n"
+            f"-# {len(entries)} cards require manual inspection"
+        )
+        sections: List[str] = [header]
+
+        chunk: List[str] = []
+        for entry in entries:
+            chunk.append(_fmt(entry))
+            if len(chunk) == CARDS_PER_SECTION:
+                sections.append("\n".join(chunk))
+                chunk = []
+        if chunk:
+            sections.append("\n".join(chunk))
 
         await self._send_channel_v2_components(
             ctx.channel,
@@ -862,7 +883,7 @@ class AuditMixin:
 
         lines = [
             f"**Phase:** `{session.phase}`",
-            f"**Event IDs harvested:** `{len(session.event_local_ids)}`",
+            f"**Event cards learned this scan:** `{len(session.event_cards)}`",
             f"**Classified:** `{len(session.classified)}`",
             f"  · KEEP `{counts[KEEP]}`  REVIEW `{counts[REVIEW]}`  SELL `{counts[SELL]}`  UNKNOWN `{counts[UNKNOWN]}`",
             f"**Current SELL selection:** `{len(session.sell_ids)}` cards",
