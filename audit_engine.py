@@ -161,7 +161,8 @@ def _best_series_keeper(cards_in_series: List[Dict[str, Any]]) -> Optional[int]:
 
 def classify_cards(
     cards: List[Dict[str, Any]],
-    event_local_ids: Set[int],
+    session_event_cards: Dict[str, Dict[str, Any]],
+    persistent_event_cards: Dict[str, Dict[str, Any]],
     locked_local_ids: Set[int],
 ) -> List[Dict[str, Any]]:
     """Return each card annotated with disposition + reasons.
