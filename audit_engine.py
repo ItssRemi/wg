@@ -71,6 +71,7 @@ UNKNOWN = "UNKNOWN"
 # Reason tags (for display)
 REASON_LOCKED = "locked"
 REASON_EVENT = "event card"
+REASON_SIGMA = "sigma protection"
 REASON_SERIES_LAST = "last series rep"
 REASON_SERIES_PROTECTED = "protected series (excess)"
 REASON_HIGH_STATS = "high stats"
@@ -124,6 +125,20 @@ def _luck(card: Dict[str, Any]) -> Optional[int]:
 def _chunk(items: List[Any], size: int):
     for i in range(0, len(items), size):
         yield items[i: i + size]
+
+
+def _normalise_card_name(name: str) -> str:
+    return " ".join(str(name).strip().casefold().split())
+
+
+def _card_identity(card: Dict[str, Any]) -> str:
+    name = _normalise_card_name(card.get("name", ""))
+    rarity = str(
+        card.get("rarity_symbol")
+        or card.get("type_symbol")
+        or ""
+    ).strip().casefold()
+    return f"{name}|{rarity}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -187,6 +202,20 @@ def classify_cards(
         disposition (KEEP/REVIEW/SELL/UNKNOWN), reasons (list[str]),
         dp_yield (int), shard_yield (int), card (the raw stored dict).
     """
+
+    # Event identity is based on name + rarity, not the temporary local list ID.
+    # Persistent event cards therefore remain protected even when list IDs shift.
+    event_identities: Set[str] = set(session_event_cards)
+    event_identities.update(persistent_event_cards)
+
+    # Sigma cards seen in any past event scan are permanently protected —
+    # they are rare enough that losing one by accident is unacceptable.
+    persistent_sigma_identities: Set[str] = {
+        identity
+        for identity, data in persistent_event_cards.items()
+        if str(data.get("rarity", "")).strip().lower() == "σ"
+    }
+
     # ── Pre-pass: determine the one local_id to keep per protected series ──
     # Group all cards that belong to a protected series, then pick exactly one
     # keeper per series (the highest-skill card, ties by lowest local_id).
@@ -222,10 +251,15 @@ def classify_cards(
             disposition = KEEP
             reasons.append(REASON_LOCKED)
 
-        # ── 2. Current event card ──
-        elif local_id is not None and int(local_id) in event_local_ids:
+        # ── 2. Current or past event card (matched by name + rarity) ──
+        elif _card_identity(card) in event_identities:
             disposition = KEEP
             reasons.append(REASON_EVENT)
+
+        # ── 2b. Sigma seen in any past event — permanently protected ──
+        elif _card_identity(card) in persistent_sigma_identities:
+            disposition = KEEP
+            reasons.append(REASON_SIGMA)
 
         # ── 3. Omega — permanent hard keep ──
         elif sym in OMEGA_SYMBOLS:
