@@ -384,6 +384,11 @@ class Waifugami(AuditMixin, commands.Cog):
             adventure_reminder={},
             cooldowns={},
             cooldown_reminders={},
+            audit_protection={
+                "event_cards": {},
+                "sigma_cards": {},
+                "protected_series": {},
+            },
         )
         self._pending_removals: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._removal_prompts: Dict[int, Dict[str, Any]] = {}
@@ -460,6 +465,8 @@ class Waifugami(AuditMixin, commands.Cog):
             completion_schema_migrated=False,
             # ---- .i <id> catalog learning ----
             wishlist_by_waifu_id={},
+            event_catalog = {},
+            event_aliases = {}
         )
         self.listener_config.register_user(
             wanted_by_series={},
