@@ -448,7 +448,7 @@ class AuditMixin:
         sections: List[str] = [
             f"## Review & Unknown Cards\n-# {len(entries)} cards require manual inspection"
         ]
-        for entry in entries[:40]:
+        for entry in entries:
             skill_str = f"{entry['skill']:.2f}" if entry["skill"] is not None else "?"
             luck_str = str(entry["luck"]) if entry["luck"] is not None else "?"
             sections.append(
@@ -456,9 +456,6 @@ class AuditMixin:
                 f"Skill {skill_str}  Luck {luck_str}\n"
                 f"-# {entry['disposition']} · {', '.join(entry['reasons'])}"
             )
-
-        if len(entries) > 40:
-            sections.append(f"-# … and {len(entries) - 40} more not shown.")
 
         await self._send_channel_v2_components(
             ctx.channel,
