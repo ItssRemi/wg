@@ -1,6 +1,28 @@
 """audit_engine.py — Pure classification logic for the Waifugami audit engine.
 
 No discord/redbot imports.  Import freely in tests and in audit.py.
+
+Classification flow
+────────────────────
+For each card in the user's collection:
+
+  1. Locked (🔒 flag only)           → KEEP
+  2. Known event card (name|rarity)   → KEEP   [session or persistent]
+  3. Known sigma card (persistent)    → KEEP   [explicit sigma store, separate
+                                                from event_cards so intent is
+                                                unambiguous even if the card
+                                                later leaves the event list]
+  4. Omega rarity                     → KEEP
+  5. Protected series
+       - series NOT yet reviewed      → REVIEW (needs user decision)
+       - series reviewed, card kept   → KEEP
+       - series reviewed, card sold   → SELL
+       - series reviewed, no decision → REVIEW
+  6. High stats (Skill>90 AND Luck>5) → KEEP
+  7. Zeta / Epsilon rarity            → REVIEW
+  8. Stats unknown                    → UNKNOWN
+  9. Near-threshold stats             → REVIEW
+ 10. Everything else                  → SELL
 """
 from __future__ import annotations
 
@@ -15,7 +37,8 @@ from typing import Any, Dict, List, Optional, Set
 WAIFUGAMI_ID = 722418701852344391
 V2_FLAG = 32768
 
-# Series IDs whose last remaining representative must never be removed.
+# Series IDs that must always have at least one representative in the collection.
+# Removal of cards from these series requires an explicit user review decision.
 PROTECTED_SERIES_IDS: Set[int] = {
     1, 4, 5, 7, 19, 41, 65, 86, 88, 166, 239, 240, 371, 387, 394, 401, 499
 }
@@ -33,52 +56,54 @@ RARITY_DP: Dict[str, int] = {
 }
 OMEGA_SHARDS_PER_CARD = 20
 
-# Rarity symbols considered high-value enough to always put in REVIEW first.
+# Rarity symbols that go to REVIEW before any removal (high economic value).
 HIGH_VALUE_REVIEW_RARITIES: Set[str] = {"ζ", "ε"}
-# Omega is always hard-protected.
+
+# Omega is always a hard keep regardless of any other rule.
 OMEGA_SYMBOLS: Set[str] = {"ω"}
 
-# Stats thresholds for automatic protection.
+# Stats thresholds: a card with Skill > threshold AND Luck > threshold is kept.
 SKILL_PROTECT_THRESHOLD = 90.0
 LUCK_PROTECT_THRESHOLD = 5
 
-# Batch size for .rm commands.
+# Maximum cards per .rm batch (index-shift safety).
 RM_BATCH_SIZE = 30
 
-# How long (seconds) an audit session stays alive without activity.
-AUDIT_SESSION_TTL = 60 * 30  # 30 minutes
+# Audit session TTL in seconds (30 minutes of inactivity).
+AUDIT_SESSION_TTL = 60 * 30
 
-# Regex to detect the Waifugami list embed title for a specific user.
-# We accept any user name (non-greedy) so we don't hardcode the owner.
+# ── Regexes used by the embed parser in audit.py ──────────────────────────────
+
+# Matches Waifugami's list embed title: "{owner}'s Waifus (Page N)"
 LIST_TITLE_RE = re.compile(r"^(.+?)'s Waifus \(Page (\d+)\)$", re.I)
 
-# List entry line:  "123 | 🎁 [δ] Character Name"
-# The emoji prefix (🎁 🎄 💝 🕸 🏵 etc.) is optional — we capture the whole
-# rarity bracket and the name that follows.
+# Matches a single list entry line: "123 | 🎁 [δ] Character Name"
+# The event-emoji prefix is optional.
 LIST_ENTRY_RE = re.compile(
     r"^(\d+)\s*\|\s*(?:\S+\s+)?\[([^\]]+)\]\s+(.+?)\s*$"
 )
 
-# Field name that marks the final page ("Final page?" field in the embed).
+# Matches the "Page N of M" footer field that signals pagination state.
 FINAL_PAGE_FIELD_NAME_RE = re.compile(r"Page\s+(\d+)\s+of\s+(\d+)", re.I)
 
-# Disposition labels
-KEEP = "KEEP"
-REVIEW = "REVIEW"
-SELL = "SELL"
+# ── Disposition labels ────────────────────────────────────────────────────────
+KEEP    = "KEEP"
+REVIEW  = "REVIEW"
+SELL    = "SELL"
 UNKNOWN = "UNKNOWN"
 
-# Reason tags (for display)
-REASON_LOCKED = "locked"
-REASON_EVENT = "event card"
-REASON_SIGMA = "sigma protection"
-REASON_SERIES_LAST = "last series rep"
-REASON_SERIES_PROTECTED = "protected series (excess)"
-REASON_HIGH_STATS = "high stats"
-REASON_OMEGA = "omega rarity"
-REASON_HIGH_VALUE = "high rarity (review)"
-REASON_NEAR_THRESHOLD = "near stat threshold"
-REASON_NO_STATS = "stats unknown"
+# ── Reason tags (shown to the user next to each card) ────────────────────────
+REASON_LOCKED           = "locked"
+REASON_EVENT            = "event card"
+REASON_SIGMA            = "sigma — permanent keep"
+REASON_OMEGA            = "omega rarity"
+REASON_SERIES_KEEP      = "series keep (decided)"
+REASON_SERIES_SELL      = "series sell (decided)"
+REASON_SERIES_UNREVIEWED = "series unreviewed — needs decision"
+REASON_HIGH_STATS       = "high stats"
+REASON_HIGH_VALUE       = "high rarity (review)"
+REASON_NEAR_THRESHOLD   = "near stat threshold"
+REASON_NO_STATS         = "stats unknown"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -92,24 +117,19 @@ def _rarity_symbol(card: Dict[str, Any]) -> str:
 
 
 def _dp_for_card(card: Dict[str, Any]) -> int:
-    sym = _rarity_symbol(card)
-    return RARITY_DP.get(sym, 0)
+    return RARITY_DP.get(_rarity_symbol(card), 0)
 
 
 def _shards_for_card(card: Dict[str, Any]) -> int:
-    sym = _rarity_symbol(card)
-    return OMEGA_SHARDS_PER_CARD if sym in OMEGA_SYMBOLS else 0
+    return OMEGA_SHARDS_PER_CARD if _rarity_symbol(card) in OMEGA_SYMBOLS else 0
 
 
 def _is_locked(card: Dict[str, Any]) -> bool:
-    """True only if the card carries Waifugami's actual lock flag (🔒).
+    """True only when the card carries Waifugami's actual lock flag (🔒).
 
-    Plain emoji favorites (series tags, aesthetic markers, etc.) are NOT
-    treated as protection — users apply those for organisation, not to
-    signal that a card should be kept.
+    Plain emoji favorites are organisational markers, NOT protection signals.
     """
-    fav = str(card.get("favorite") or "").strip()
-    return fav in {"🔒", "locked", "lock"}
+    return str(card.get("favorite") or "").strip() in {"🔒", "locked", "lock"}
 
 
 def _skill(card: Dict[str, Any]) -> Optional[float]:
@@ -132,214 +152,23 @@ def _normalise_card_name(name: str) -> str:
 
 
 def _card_identity(card: Dict[str, Any]) -> str:
+    """Stable identity string: normalised_name|rarity_symbol.
+
+    Used to match cards across list-ID shifts.  Two physical cards with the
+    same name and rarity share an identity; local_id is used to distinguish
+    individual copies when needed.
+    """
     name = _normalise_card_name(card.get("name", ""))
     rarity = str(
-        card.get("rarity_symbol")
-        or card.get("type_symbol")
-        or ""
+        card.get("rarity_symbol") or card.get("type_symbol") or ""
     ).strip().casefold()
     return f"{name}|{rarity}"
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Core classification logic
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _best_series_keeper(cards_in_series: List[Dict[str, Any]]) -> Optional[int]:
-    """Pick the single local_id to keep from a protected series.
-
-    Selection criteria (first applicable wins):
-      1. The card that is locked (🔒).
-      2. Among unlocked cards, the highest skill; ties broken by lowest local_id
-         (lowest local_id = earliest acquired = safest default).
-    Returns None if the list is empty.
-    """
-    if not cards_in_series:
-        return None
-
-    locked = [c for c in cards_in_series if _is_locked(c)]
-    if locked:
-        # If multiple are locked, keep all of them — locking is explicit intent.
-        # This function only returns ONE id as the "minimum guaranteed keeper";
-        # the caller treats every locked card as KEEP regardless.
-        # Just return the highest-skill locked one for the label.
-        best = max(locked, key=lambda c: (_skill(c) or 0.0, -(c.get("local_id") or 0)))
-        return best.get("local_id")
-
-    # No locks — pick best by skill, then lowest local_id as tiebreak.
-    best = max(
-        cards_in_series,
-        key=lambda c: (_skill(c) or 0.0, -(c.get("local_id") or 999_999)),
-    )
-    return best.get("local_id")
-
-
-def classify_cards(
-    cards: List[Dict[str, Any]],
-    session_event_cards: Dict[str, Dict[str, Any]],
-    persistent_event_cards: Dict[str, Dict[str, Any]],
-    locked_local_ids: Set[int],
-) -> List[Dict[str, Any]]:
-    """Return each card annotated with disposition + reasons.
-
-    Parameters
-    ----------
-    cards:
-        All active cards from the user's stored collection.
-    event_local_ids:
-        Local IDs harvested from `.l -event all` — these are current-event
-        characters that must be kept.
-    locked_local_ids:
-        Local IDs the user has explicitly locked (learned from .l or .v).
-        Also re-checks the stored card["favorite"] field for the 🔒 marker.
-
-    Favorites that are NOT the 🔒 lock flag are intentionally ignored as
-    protection criteria — users apply plain emoji favorites for series
-    organisation, not to signal "keep this card".
-
-    Returns a list of dicts, one per card, with keys:
-        local_id, global_id, name, rarity_symbol, skill, luck,
-        disposition (KEEP/REVIEW/SELL/UNKNOWN), reasons (list[str]),
-        dp_yield (int), shard_yield (int), card (the raw stored dict).
-    """
-
-    # Event identity is based on name + rarity, not the temporary local list ID.
-    # Persistent event cards therefore remain protected even when list IDs shift.
-    event_identities: Set[str] = set(session_event_cards)
-    event_identities.update(persistent_event_cards)
-
-    # Sigma cards seen in any past event scan are permanently protected —
-    # they are rare enough that losing one by accident is unacceptable.
-    persistent_sigma_identities: Set[str] = {
-        identity
-        for identity, data in persistent_event_cards.items()
-        if str(data.get("rarity", "")).strip().lower() == "σ"
-    }
-
-    # ── Pre-pass: determine the one local_id to keep per protected series ──
-    # Group all cards that belong to a protected series, then pick exactly one
-    # keeper per series (the highest-skill card, ties by lowest local_id).
-    protected_series_cards: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for c in cards:
-        sid = _series_id_for(c)
-        if sid is not None and sid.isdigit():
-            sid_int = int(sid)
-            if sid_int in PROTECTED_SERIES_IDS:
-                protected_series_cards[sid_int].append(c)
-
-    # series_id_int → local_id that is the designated keeper
-    series_keeper_lid: Dict[int, Optional[int]] = {
-        sid_int: _best_series_keeper(group)
-        for sid_int, group in protected_series_cards.items()
-    }
-
-    results = []
-    for card in cards:
-        local_id = card.get("local_id")
-        global_id = card.get("global_id")
-        sym = _rarity_symbol(card)
-        skill_val = _skill(card)
-        luck_val = _luck(card)
-        sid = _series_id_for(card)
-        sid_int = int(sid) if (sid is not None and sid.isdigit()) else None
-
-        disposition: Optional[str] = None
-        reasons: List[str] = []
-
-        # ── 1. Hard lock (🔒 only — plain emoji favorites are NOT protection) ──
-        if local_id in locked_local_ids or _is_locked(card):
-            disposition = KEEP
-            reasons.append(REASON_LOCKED)
-
-        # ── 2. Current or past event card (matched by name + rarity) ──
-        elif _card_identity(card) in event_identities:
-            disposition = KEEP
-            reasons.append(REASON_EVENT)
-
-        # ── 2b. Sigma seen in any past event — permanently protected ──
-        elif _card_identity(card) in persistent_sigma_identities:
-            disposition = KEEP
-            reasons.append(REASON_SIGMA)
-
-        # ── 3. Omega — permanent hard keep ──
-        elif sym in OMEGA_SYMBOLS:
-            disposition = KEEP
-            reasons.append(REASON_OMEGA)
-
-        else:
-            # ── 4. Protected series: exactly one card per series is kept ──
-            if sid_int is not None and sid_int in PROTECTED_SERIES_IDS:
-                keeper_lid = series_keeper_lid.get(sid_int)
-                if local_id is not None and local_id == keeper_lid:
-                    # This is the designated representative — keep it.
-                    disposition = KEEP
-                    reasons.append(REASON_SERIES_LAST)
-                else:
-                    # Excess card from a protected series — falls through to
-                    # normal evaluation. Tag it so the user sees it in the
-                    # sell list and understands why it's still removable.
-                    reasons.append(REASON_SERIES_PROTECTED)
-
-            # ── 5. High stats ──
-            if disposition is None:
-                if skill_val is not None and luck_val is not None:
-                    if skill_val > SKILL_PROTECT_THRESHOLD and luck_val > LUCK_PROTECT_THRESHOLD:
-                        disposition = KEEP
-                        reasons.append(REASON_HIGH_STATS)
-
-            # ── 6. High-value rarity → REVIEW before removing ──
-            if disposition is None:
-                if sym in HIGH_VALUE_REVIEW_RARITIES:
-                    disposition = REVIEW
-                    reasons.append(REASON_HIGH_VALUE)
-
-            # ── 7. Unknown stats → UNKNOWN (never auto-removed) ──
-            if disposition is None:
-                if skill_val is None or luck_val is None:
-                    disposition = UNKNOWN
-                    reasons.append(REASON_NO_STATS)
-
-            # ── 8. Near-threshold stats → REVIEW ──
-            if disposition is None:
-                near = (
-                    skill_val > SKILL_PROTECT_THRESHOLD * 0.85
-                    or luck_val >= LUCK_PROTECT_THRESHOLD
-                )
-                if near:
-                    disposition = REVIEW
-                    reasons.append(REASON_NEAR_THRESHOLD)
-
-            # ── 9. Everything else is safe to sell ──
-            if disposition is None:
-                disposition = SELL
-
-        dp = _dp_for_card(card)
-        shards = _shards_for_card(card)
-
-        results.append({
-            "local_id": local_id,
-            "global_id": global_id,
-            "name": card.get("name", "Unknown"),
-            "rarity_symbol": sym,
-            "skill": skill_val,
-            "luck": luck_val,
-            "series_id": sid,
-            "disposition": disposition,
-            "reasons": reasons,
-            "dp_yield": dp,
-            "shard_yield": shards,
-            "card": card,
-        })
-
-    return results
-
-
 def _series_id_for(card: Dict[str, Any]) -> Optional[str]:
-    """Extract a normalised series_id string from a stored card dict."""
+    """Normalised series_id string, or None if unavailable."""
     raw = card.get("series_id")
     if raw is None:
-        # Some cards store waifu_id but not series_id; we cannot derive it
-        # without the catalog, so callers must enrich before classifying.
         return None
     try:
         return str(int(raw))
@@ -348,5 +177,179 @@ def _series_id_for(card: Dict[str, Any]) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Session state
+# Series review helpers (pure — no I/O)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def series_review_decision(
+    card: Dict[str, Any],
+    series_review: Dict[str, Any],
+) -> Optional[str]:
+    """Look up the persisted decision for this card inside a series review.
+
+    series_review is the value at protected_series[series_id_str].
+
+    Returns "keep", "sell", or None (no decision recorded yet).
+    """
+    decisions = series_review.get("decisions", {})
+    identity = _card_identity(card)
+    entry = decisions.get(identity)
+    if entry is None:
+        return None
+    return str(entry.get("decision", "")).lower() or None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core classification
+# ──────────────────────────────────────────────────────────────────────────────
+
+def classify_cards(
+    cards: List[Dict[str, Any]],
+    session_event_cards: Dict[str, Dict[str, Any]],
+    persistent_event_cards: Dict[str, Dict[str, Any]],
+    persistent_sigma_cards: Dict[str, Dict[str, Any]],
+    persistent_series_reviews: Dict[str, Dict[str, Any]],
+    locked_local_ids: Set[int],
+) -> List[Dict[str, Any]]:
+    """Classify every card in the user's active collection.
+
+    Parameters
+    ----------
+    cards:
+        Active cards from the stored collection (enriched with series_id).
+    session_event_cards:
+        Cards seen during the current `.l -event all` scan:
+        identity → snapshot dict.
+    persistent_event_cards:
+        All event cards ever seen across all scans:
+        identity → snapshot dict.
+    persistent_sigma_cards:
+        Sigma cards seen in any past event scan, stored separately so the
+        Sigma protection intent is unambiguous even when sigma cards leave
+        the active event list.  identity → snapshot dict.
+    persistent_series_reviews:
+        User decisions for protected-series cards:
+        series_id_str → { "status": str, "decisions": { identity → decision } }.
+    locked_local_ids:
+        Set of local_ids the user has explicitly locked (from .l or .v scans).
+        _is_locked() also checks the stored card["favorite"] field directly.
+
+    Returns a list of result dicts, one per card:
+        local_id, global_id, name, rarity_symbol, skill, luck, series_id,
+        disposition (KEEP/REVIEW/SELL/UNKNOWN), reasons (list[str]),
+        dp_yield (int), shard_yield (int), card (raw stored dict).
+    """
+    # Build the combined event identity set for fast lookup.
+    event_identities: Set[str] = set(session_event_cards) | set(persistent_event_cards)
+
+    # Sigma identities come from their own dedicated store, NOT from
+    # event_identities — this makes the protection intent explicit and keeps
+    # it alive even if the card is no longer on the active event list.
+    sigma_identities: Set[str] = set(persistent_sigma_cards)
+
+    results: List[Dict[str, Any]] = []
+
+    for card in cards:
+        local_id   = card.get("local_id")
+        global_id  = card.get("global_id")
+        sym        = _rarity_symbol(card)
+        skill_val  = _skill(card)
+        luck_val   = _luck(card)
+        sid        = _series_id_for(card)
+        sid_int    = int(sid) if (sid is not None and sid.isdigit()) else None
+        identity   = _card_identity(card)
+
+        disposition: Optional[str] = None
+        reasons: List[str] = []
+
+        # ── 1. Hard lock (🔒 only) ───────────────────────────────────────────
+        if local_id in locked_local_ids or _is_locked(card):
+            disposition = KEEP
+            reasons.append(REASON_LOCKED)
+
+        # ── 2. Event card (session or persistent, matched by name+rarity) ────
+        elif identity in event_identities:
+            disposition = KEEP
+            reasons.append(REASON_EVENT)
+
+        # ── 3. Sigma — permanent keep from its own dedicated store ───────────
+        elif identity in sigma_identities:
+            disposition = KEEP
+            reasons.append(REASON_SIGMA)
+
+        # ── 4. Omega — hard keep ─────────────────────────────────────────────
+        elif sym in OMEGA_SYMBOLS:
+            disposition = KEEP
+            reasons.append(REASON_OMEGA)
+
+        else:
+            # ── 5. Protected series — consult persisted user decisions ────────
+            if sid_int is not None and sid_int in PROTECTED_SERIES_IDS:
+                series_review = persistent_series_reviews.get(str(sid_int), {})
+                decision = series_review_decision(card, series_review)
+
+                if decision == "keep":
+                    disposition = KEEP
+                    reasons.append(REASON_SERIES_KEEP)
+                elif decision == "sell":
+                    # Explicit sell decision — falls through to normal
+                    # evaluation below; tag it so the sell list is clear.
+                    reasons.append(REASON_SERIES_SELL)
+                else:
+                    # No decision recorded yet → must review before removing.
+                    disposition = REVIEW
+                    reasons.append(REASON_SERIES_UNREVIEWED)
+
+            # ── 6. High stats ─────────────────────────────────────────────────
+            if disposition is None:
+                if (
+                    skill_val is not None and luck_val is not None
+                    and skill_val > SKILL_PROTECT_THRESHOLD
+                    and luck_val > LUCK_PROTECT_THRESHOLD
+                ):
+                    disposition = KEEP
+                    reasons.append(REASON_HIGH_STATS)
+
+            # ── 7. High-value rarity → REVIEW before removal ─────────────────
+            if disposition is None and sym in HIGH_VALUE_REVIEW_RARITIES:
+                disposition = REVIEW
+                reasons.append(REASON_HIGH_VALUE)
+
+            # ── 8. Unknown stats → UNKNOWN (never auto-removed) ──────────────
+            if disposition is None and (skill_val is None or luck_val is None):
+                disposition = UNKNOWN
+                reasons.append(REASON_NO_STATS)
+
+            # ── 9. Near-threshold stats → REVIEW ─────────────────────────────
+            if disposition is None:
+                if (
+                    skill_val > SKILL_PROTECT_THRESHOLD * 0.85
+                    or luck_val >= LUCK_PROTECT_THRESHOLD
+                ):
+                    disposition = REVIEW
+                    reasons.append(REASON_NEAR_THRESHOLD)
+
+            # ── 10. Safe to sell ──────────────────────────────────────────────
+            if disposition is None:
+                disposition = SELL
+
+        results.append({
+            "local_id":       local_id,
+            "global_id":      global_id,
+            "name":           card.get("name", "Unknown"),
+            "rarity_symbol":  sym,
+            "skill":          skill_val,
+            "luck":           luck_val,
+            "series_id":      sid,
+            "disposition":    disposition,
+            "reasons":        reasons,
+            "dp_yield":       _dp_for_card(card),
+            "shard_yield":    _shards_for_card(card),
+            "card":           card,
+        })
+
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Session state (used by AuditMixin in audit.py)
 # ──────────────────────────────────────────────────────────────────────────────
