@@ -321,8 +321,17 @@ class AuditMixin:
     ) -> Tuple[Optional[str], int, int, List[Tuple[int, str, str]]]:
         """Parse one page of `.l -event all` output.
 
-        Returns (owner_name, page_index, total_pages, entries)
-        where entries = [(local_id, rarity_symbol, name), ...]
+        Returns (owner_name, page_index, total_pages, entries) where:
+          - page_index  is 0-based (Waifugami natively sends "Page 0 of 107",
+                        "Page 1 of 107", … "Page 107 of 107")
+          - total_pages is the value after "of" (e.g. 107 means pages 0..107,
+                        i.e. 108 total pages)
+          - entries     = [(local_id, rarity_symbol, name), ...]
+
+        Waifugami pages are already 0-based — no conversion needed.
+        The completion check is:
+            seen_pages == set(range(total_pages + 1))
+        because pages run from 0 through total_pages inclusive.
         """
         title = embed.title or ""
         m = LIST_TITLE_RE.match(title)
@@ -336,7 +345,8 @@ class AuditMixin:
         for field in embed.fields:
             fm = FINAL_PAGE_FIELD_NAME_RE.search(field.name or "")
             if fm:
-                page_index = int(fm.group(1))
+                # Pages are already 0-based in Waifugami's embed field.
+                page_index  = int(fm.group(1))
                 total_pages = int(fm.group(2))
                 break
 
@@ -345,8 +355,8 @@ class AuditMixin:
             lm = LIST_ENTRY_RE.match(line.strip())
             if lm:
                 local_id = int(lm.group(1))
-                rarity = lm.group(2).strip()
-                name = lm.group(3).strip()
+                rarity   = lm.group(2).strip()
+                name     = lm.group(3).strip()
                 entries.append((local_id, rarity, name))
 
         return owner_name, page_index, total_pages, entries
@@ -381,10 +391,16 @@ class AuditMixin:
     async def _audit_collect_event_page(
         self, message: discord.Message
     ) -> None:
-        """Called from on_message_edit when a Waifugami list embed updates.
+        """Process one page of a `.l -event all` embed (new message OR edit).
 
-        Accumulates event-card local_ids across every page of `.l -event all`.
-        Advances to classification automatically once the last page is seen.
+        Called for:
+          - The initial new message (page 0) via audit_on_new_message
+          - Every subsequent page edit via audit_on_message_edit
+
+        page_index is already 0-based when it arrives here (normalised by
+        _parse_event_list_page).  Completion fires only when every page in
+        range(total_pages) has been captured — not on "current == final",
+        which could trigger on a single missed edit.
         """
         if not message.embeds:
             return
@@ -393,8 +409,7 @@ class AuditMixin:
         if owner_name is None:
             return
 
-        # Find the session whose list_message_id matches, or whose channel
-        # matches and is still in the harvesting phase.
+        # Find the matching harvesting session for this channel.
         session: Optional[AuditSession] = None
         for s in list(self._audit_sessions.values()):
             if s.channel_id != message.channel.id:
@@ -413,18 +428,21 @@ class AuditMixin:
 
         for local_id, rarity, name in entries:
             identity = _card_identity(name, rarity)
-
             session.event_cards[identity] = _card_snapshot(
                 local_id=local_id,
                 name=name,
                 rarity=rarity,
             )
-        session.seen_pages.add(page_index)
 
+        # page_index is 0-based; record it and update total if known.
+        session.seen_pages.add(page_index)
         if total_pages > 0:
             session.total_pages = total_pages
 
-        # Check if we have seen all pages.
+        # Complete only when EVERY expected page has been captured.
+        # Pages run 0 through total_pages inclusive, so the full set is
+        # range(total_pages + 1).  We never short-circuit on "current == last"
+        # alone — a missed edit would produce an incomplete event catalogue.
         all_seen = (
             session.total_pages is not None
             and session.seen_pages == set(range(session.total_pages + 1))
@@ -432,22 +450,24 @@ class AuditMixin:
 
         channel = self.bot.get_channel(session.channel_id)
 
-        if all_seen or (total_pages > 0 and page_index == total_pages):
+        if all_seen:
             await self._persist_event_cards(
                 session.user_id,
                 session.event_cards,
             )
             await self._audit_do_classify(session, channel)
         else:
-            # Update the guide message with live progress.
+            # Show live progress in the guide message.
             if channel and session.guide_message_id:
+                seen_count = len(session.seen_pages)
+                total_str  = str(session.total_pages) if session.total_pages else "?"
                 try:
                     guide = channel.get_partial_message(session.guide_message_id)
                     await guide.edit(
                         content=(
                             f"-# Harvesting event cards… "
                             f"{len(session.event_cards)} found so far "
-                            f"(page {page_index} of {total_pages or '?'}). "
+                            f"(page {seen_count} of {total_str} seen). "
                             "Keep clicking ➡."
                         )
                     )
@@ -802,15 +822,46 @@ class AuditMixin:
             )
             self._audit_cancel(session.user_id)
 
-    # ── Listener hook — call this from on_message_edit_cards ──────────────
+    # ── Listener hooks ────────────────────────────────────────────────────
+    # Two entry points: new messages (page 1) and message edits (pages 2+).
+    # Both route to _audit_collect_event_page which is page-order agnostic.
+
+    async def audit_on_new_message(self, message: discord.Message) -> bool:
+        """Capture the FIRST page of `.l -event all`, which arrives as a new message.
+
+        Call this from on_message_cards in waifugami.py, after the WAIFUGAMI_ID
+        guard, before any other embed processing.
+
+        Returns True if the message was consumed by an active audit harvest.
+        """
+        if message.author.id != WAIFUGAMI_ID:
+            return False
+        if not message.embeds:
+            return False
+
+        embed = message.embeds[0]
+        owner_name, page_index, total_pages, entries = self._parse_event_list_page(embed)
+        if owner_name is None:
+            return False
+
+        for session in list(self._audit_sessions.values()):
+            if (
+                session.channel_id == message.channel.id
+                and session.phase == "harvesting"
+                and session.list_message_id is None   # only match before we see any page
+            ):
+                await self._audit_collect_event_page(message)
+                return True
+
+        return False
 
     async def audit_on_message_edit(
         self, before: discord.Message, after: discord.Message
     ) -> bool:
-        """Return True if the edit was consumed by an active audit session.
+        """Capture pages 2+ of `.l -event all`, which arrive as message edits.
 
-        Call this near the top of on_message_edit_cards so normal scan
-        logic doesn't also try to process the event list pages.
+        Call this near the top of on_message_edit_cards in waifugami.py.
+        Returns True if the edit was consumed by an active audit harvest.
         """
         if after.author.id != WAIFUGAMI_ID:
             return False
@@ -822,7 +873,6 @@ class AuditMixin:
         if owner_name is None:
             return False
 
-        # Find a matching harvesting session in this channel.
         for session in list(self._audit_sessions.values()):
             if (
                 session.channel_id == after.channel.id
