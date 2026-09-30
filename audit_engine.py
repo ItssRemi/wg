@@ -80,7 +80,10 @@ LIST_TITLE_RE = re.compile(r"^(.+?)'s Waifus \(Page (\d+)\)$", re.I)
 # Matches a single list entry line: "123 | 🎁 [δ] Character Name"
 # The event-emoji prefix is optional.
 LIST_ENTRY_RE = re.compile(
-    r"^(\d+)\s*\|\s*(?:\S+\s+)?\[([^\]]+)\]\s+(.+?)\s*$"
+    # Matches both "123 | 🎁 [δ] Name" and "15 |  [β] Name" (no emoji).
+    # Some entries have only a bare space where the emoji would be;
+    # \s* after the optional emoji token absorbs that space cleanly.
+    r"^(\d+)\s*\|\s*(?:\S+\s)?\s*\[([^\]]+)\]\s+(.+?)\s*$"
 )
 
 # Matches the "Page N of M" footer field that signals pagination state.
