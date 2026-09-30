@@ -747,6 +747,13 @@ class Waifugami(AuditMixin, commands.Cog):
             return None
         refresh = ADVENTURE_REFRESH_RE.search(description)
         rank = match.group(1).upper()
+        # NOTE: previously this looked for the literal text "**Team 1-4**
+        # is adventuring!", but real team names are whatever the player
+        # named them (e.g. "**[⋆˚]** is adventuring!"), so that regex never
+        # actually matched and `.ad` would keep offering team-building
+        # advice even while a team was already out on an active quest.
+        # The presence/absence of "No teams are out on an adventure
+        # currently" is the reliable signal, so derive both fields from it.
         teams_out = "No teams are out on an adventure currently" not in description
         return {
             "state": "current_adventure" if teams_out else "new_quest",
@@ -1235,7 +1242,7 @@ class Waifugami(AuditMixin, commands.Cog):
         if not active:
             # Adventure was started before the bot began tracking (e.g. bot
             # restarted mid-adventure).  Synthesise a minimal record so that
-            # ..wgcd shows the remaining time instead of "Not on an adventure".
+            # .wgcd shows the remaining time instead of "Not on an adventure".
             active = {
                 "adventure_id": f"recovered:{message.guild.id}:{user_id}:{message.id}",
                 "guild_id": message.guild.id,
@@ -1517,6 +1524,11 @@ class Waifugami(AuditMixin, commands.Cog):
             return
         if message.author.id != WAIFUGAMI_ID:
             return
+
+        # ---- audit engine: capture first page of .l -event all ----
+        if await self.audit_on_new_message(message):
+            return
+        # ---- end audit hook ----
 
         # .i <id> embeds may arrive in card-tracking channels that are NOT
         # configured as spawn channels, so the spawn listener's _learn_from_info_embed
