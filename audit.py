@@ -28,16 +28,8 @@ from .audit_engine import (
     WAIFUGAMI_ID, V2_FLAG,
     classify_cards, _chunk, _is_locked, _skill, _luck,
     _rarity_symbol, _dp_for_card, _shards_for_card,
-    _card_identity, _normalise_card_name, _series_id_for,
+    _card_identity, _series_id_for,
 )
-
-def _normalise_card_name(name: str) -> str:
-    return " ".join(str(name).strip().casefold().split())
-
-
-def _card_identity(name: str, rarity: str) -> str:
-    return f"{_normalise_card_name(name)}|{str(rarity).strip().casefold()}"
-
 
 def _card_snapshot(
     *,
@@ -61,7 +53,7 @@ class AuditSession:
         "user_id", "channel_id", "guild_id",
         "phase",               # "harvesting" | "classified" | "confirming" | "executing"
         "list_message_id",     # Waifugami's .l -event all message id
-        "event_cards",         # Dict[str, Dict[str, Any]] — identity → snapshot, accumulated across all pages
+        "event_cards",         # Dict[str, Dict[str, Any]] — local_id → snapshot, accumulated across all pages
         "seen_pages",          # Set[int]
         "total_pages",         # int | None
         "classified",          # List[dict] — output of classify_cards()
@@ -171,54 +163,58 @@ class AuditMixin:
         user_id: int,
         cards: Dict[str, Dict[str, Any]],
     ) -> None:
-        """Persist event-card identities learned during a scan.
+        """Persist every physical event card seen during the scan.
 
-        Each call is additive — previously learned cards are never deleted.
+        The dictionary key is the card's local list ID, NOT name+rarity.
 
-        Sigma cards (rarity == σ) are written into their OWN dedicated store
-        (sigma_cards) in addition to event_cards.  This keeps Sigma protection
-        alive and semantically clear even if the card later leaves the event
-        list, because sigma_cards is never pruned.
+        This is intentional. Multiple physical copies of the same character
+        and rarity must never collapse into one record.
+
+        The local ID is only the last-known list position. It is not treated
+        as a permanent identity. Name and rarity are retained alongside it
+        so future scans can reconcile the card if list IDs shift.
         """
         if not cards:
             return
 
-        protection   = await self._audit_protection(user_id)
-        event_cards  = protection["event_cards"]
-        sigma_cards  = protection["sigma_cards"]
+        protection = await self._audit_protection(user_id)
+        event_cards = protection["event_cards"]
+        sigma_cards = protection["sigma_cards"]
 
-        for identity, snapshot in cards.items():
-            existing = event_cards.get(identity)
+        for local_id_key, snapshot in cards.items():
+            # Store each observed physical card separately.
+            #
+            # We use a string key because Config serialises dictionaries to
+            # JSON-like data and JSON object keys are strings.
+            event_cards[str(local_id_key)] = dict(snapshot)
 
-            if existing:
-                merged = dict(existing)
-                if snapshot.get("last_seen_id") is not None:
-                    merged["last_seen_id"] = snapshot["last_seen_id"]
-                if snapshot.get("global_id") is not None:
-                    merged["global_id"] = snapshot["global_id"]
-                merged["name"]         = snapshot["name"]
-                merged["rarity"]       = snapshot["rarity"]
-                merged["last_seen_at"] = snapshot["last_seen_at"]
-                event_cards[identity]  = merged
-            else:
-                event_cards[identity] = dict(snapshot)
-
-            # Sigma goes into its own store — separate from event_cards so
-            # the protection survives even when the event changes.
+            # Sigma cards are permanently protected too.
+            # Keep them in their own dedicated store.
             if str(snapshot.get("rarity", "")).strip().lower() == "σ":
-                existing_sigma = sigma_cards.get(identity, {})
-                merged_sigma   = dict(existing_sigma)
+                sigma_key = str(local_id_key)
+
+                existing_sigma = sigma_cards.get(sigma_key, {})
+                merged_sigma = dict(existing_sigma)
                 merged_sigma.update({
-                    "name":          snapshot["name"],
-                    "rarity":        snapshot["rarity"],
-                    "last_seen_at":  snapshot["last_seen_at"],
+                    "name": snapshot.get("name", "Unknown"),
+                    "rarity": snapshot.get("rarity", "σ"),
+                    "last_seen_at": snapshot.get(
+                        "last_seen_at",
+                        time.time(),
+                    ),
                 })
+
                 if snapshot.get("last_seen_id") is not None:
                     merged_sigma["last_seen_id"] = snapshot["last_seen_id"]
-                sigma_cards[identity] = merged_sigma
+
+                if snapshot.get("global_id") is not None:
+                    merged_sigma["global_id"] = snapshot["global_id"]
+
+                sigma_cards[sigma_key] = merged_sigma
 
         protection["event_cards"] = event_cards
         protection["sigma_cards"] = sigma_cards
+
         await self._save_audit_protection(user_id, protection)
 
     def _enrich_with_catalog(self, cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -427,8 +423,7 @@ class AuditMixin:
         session.list_message_id = message.id
 
         for local_id, rarity, name in entries:
-            identity = _card_identity(name, rarity)
-            session.event_cards[identity] = _card_snapshot(
+            session.event_cards[str(local_id)] = _card_snapshot(
                 local_id=local_id,
                 name=name,
                 rarity=rarity,
@@ -460,14 +455,27 @@ class AuditMixin:
             # Show live progress in the guide message.
             if channel and session.guide_message_id:
                 seen_count = len(session.seen_pages)
-                total_str  = str(session.total_pages) if session.total_pages else "?"
+
+                if session.total_pages is not None:
+                    total_page_count = session.total_pages + 1
+                    total_str = str(session.total_pages)
+                else:
+                    total_page_count = "?"
+                    total_str = "?"
+
                 try:
-                    guide = channel.get_partial_message(session.guide_message_id)
+                    guide = channel.get_partial_message(
+                        session.guide_message_id
+                    )
+
                     await guide.edit(
                         content=(
-                            f"-# Harvesting event cards… "
-                            f"{len(session.event_cards)} found so far "
-                            f"(page {seen_count} of {total_str} seen). "
+                            "-# Harvesting event cards...\n"
+                            f"Waifugami page `{page_index} of {total_str}`\n"
+                            f"Pages captured: `{seen_count}/{total_page_count}`\n"
+                            f"Cards on this page: `{len(entries)}`\n"
+                            f"Cards marked preserve: "
+                            f"`{len(session.event_cards)}`\n\n"
                             "Keep clicking ➡."
                         )
                     )
