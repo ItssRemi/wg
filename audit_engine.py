@@ -168,6 +168,35 @@ def _card_identity(card: Dict[str, Any]) -> str:
     return f"{name}|{rarity}"
 
 
+def _event_identity_set(
+    event_cards: Dict[str, Dict[str, Any]],
+) -> Set[str]:
+    """Build name+rarity identities from physical event-card records.
+
+    Event-card storage is keyed by local list ID so duplicate physical cards
+    are never collapsed. Classification still needs a name+rarity identity
+    set so every active copy of a learned event card is protected.
+    """
+    identities: Set[str] = set()
+
+    for snapshot in event_cards.values():
+        if not isinstance(snapshot, dict):
+            continue
+
+        name = snapshot.get("name")
+        rarity = snapshot.get("rarity")
+
+        if name is None or rarity is None:
+            continue
+
+        identities.add(
+            f"{_normalise_card_name(name)}|"
+            f"{str(rarity).strip().casefold()}"
+        )
+
+    return identities
+
+
 def _series_id_for(card: Dict[str, Any]) -> Optional[str]:
     """Normalised series_id string, or None if unavailable."""
     raw = card.get("series_id")
@@ -241,13 +270,20 @@ def classify_cards(
         disposition (KEEP/REVIEW/SELL/UNKNOWN), reasons (list[str]),
         dp_yield (int), shard_yield (int), card (raw stored dict).
     """
-    # Build the combined event identity set for fast lookup.
-    event_identities: Set[str] = set(session_event_cards) | set(persistent_event_cards)
+    # Event cards are stored individually by local list ID so duplicate
+    # physical cards are never collapsed. Classification still protects
+    # every active copy matching any learned event name+rarity.
+    event_identities: Set[str] = (
+        _event_identity_set(session_event_cards)
+        | _event_identity_set(persistent_event_cards)
+    )
 
     # Sigma identities come from their own dedicated store, NOT from
     # event_identities — this makes the protection intent explicit and keeps
     # it alive even if the card is no longer on the active event list.
-    sigma_identities: Set[str] = set(persistent_sigma_cards)
+    sigma_identities: Set[str] = _event_identity_set(
+        persistent_sigma_cards
+    )
 
     results: List[Dict[str, Any]] = []
 
