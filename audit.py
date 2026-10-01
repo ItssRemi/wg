@@ -679,18 +679,15 @@ class AuditMixin:
         }
 
         route = Route(
-            "POST",
-            "/interactions/{interaction_id}/{interaction_token}/callback",
-            interaction_id=interaction.id,
+            "PATCH",
+            "/webhooks/{application_id}/{interaction_token}/messages/@original",
+            application_id=self.bot.user.id,
             interaction_token=interaction.token,
         )
 
         await self.bot.http.request(
             route,
-            json={
-                "type": 7,
-                "data": payload,
-            },
+            json=payload,
         )
 
     def _series_needs_review(
