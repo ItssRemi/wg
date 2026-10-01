@@ -62,6 +62,7 @@ class AuditSession:
         "event_cards",         # Dict[str, Dict[str, Any]] — local_id → snapshot, accumulated across all pages
         "seen_pages",          # Set[int]
         "total_pages",         # int | None
+        "parse_failures"
         "classified",          # List[dict] — output of classify_cards()
         "sell_ids",            # List[int] — local_ids selected for removal
         "rarity_filter",       # Optional[str]
@@ -82,6 +83,7 @@ class AuditSession:
         self.event_cards: Dict[str, Dict[str, Any]] = {}
         self.seen_pages: Set[int] = set()
         self.total_pages: Optional[int] = None
+        self.parse_failures: int = 0
         self.classified: List[Dict[str, Any]] = []
         self.sell_ids: List[int] = []
         self.rarity_filter: Optional[str] = None
@@ -322,7 +324,13 @@ class AuditMixin:
     @staticmethod
     def _parse_event_list_page(
         embed: discord.Embed,
-    ) -> Tuple[Optional[str], int, int, List[Tuple[int, str, str, str]]]:
+    ) -> Tuple[
+        Optional[str],
+        int,
+        int,
+        List[Tuple[int, str, str, str]],
+        int,
+    ]:
         """Parse one page of `.l -event all` output.
 
         Returns (owner_name, page_index, total_pages, entries) where:
@@ -339,7 +347,7 @@ class AuditMixin:
         title = embed.title or ""
         m = LIST_TITLE_RE.match(title)
         if not m:
-            return None, 0, 0, []
+            return None, 0, 0, [], 0
 
         owner_name = m.group(1)
         page_index: int = 0
@@ -354,9 +362,14 @@ class AuditMixin:
                 break
 
         entries: List[Tuple[int, str, str, str]] = []
+        parse_failures = 0
 
         for line in (embed.description or "").splitlines():
             raw_line = line.strip()
+
+            if not raw_line:
+                continue
+
             lm = LIST_ENTRY_RE.match(raw_line)
 
             if lm:
@@ -368,8 +381,18 @@ class AuditMixin:
                 entries.append(
                     (local_id, status_emoji, rarity, name)
                 )
+            elif "|" in raw_line:
+                # A line that looks like a card entry but failed to parse
+                # must never be silently ignored.
+                parse_failures += 1
 
-        return owner_name, page_index, total_pages, entries
+        return (
+            owner_name,
+            page_index,
+            total_pages,
+            entries,
+            parse_failures,
+        )
 
     # ── Stage 1: harvest ──────────────────────────────────────────────────
 
@@ -415,9 +438,17 @@ class AuditMixin:
         if not message.embeds:
             return
         embed = message.embeds[0]
-        owner_name, page_index, total_pages, entries = self._parse_event_list_page(embed)
+        (
+            owner_name,
+            page_index,
+            total_pages,
+            entries,
+            parse_failures,
+        ) = self._parse_event_list_page(embed)
         if owner_name is None:
             return
+
+        session.parse_failures += parse_failures
 
         # Find the matching harvesting session for this channel.
         session: Optional[AuditSession] = None
