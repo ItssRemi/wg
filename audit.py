@@ -57,21 +57,23 @@ class AuditSession:
 
     __slots__ = (
         "user_id", "channel_id", "guild_id",
-        "phase",               # "harvesting" | "classified" | "confirming" | "executing"
-        "list_message_id",     # Waifugami's .l -event all message id
-        "event_cards",         # Dict[str, Dict[str, Any]] — local_id → snapshot, accumulated across all pages
-        "seen_pages",          # Set[int]
-        "total_pages",         # int | None
+        "phase",                    # "harvesting" | "classified" | "confirming" | "executing"
+        "list_message_id",          # Waifugami's .l -event all message id
+        "event_cards",              # Dict[str, Dict[str, Any]] — local_id → snapshot, accumulated across all pages
+        "seen_pages",               # Set[int]
+        "total_pages",              # int | None
         "parse_failures"
-        "classified",          # List[dict] — output of classify_cards()
-        "sell_ids",            # List[int] — local_ids selected for removal
-        "rarity_filter",       # Optional[str]
-        "dupes_only",          # bool
-        "guide_message_id",    # message we edit with progress
-        "created",             # float (monotonic)
-        "last_active",         # float (monotonic)
-        "batch_queue",         # List[List[int]] — remaining batches to execute
-        "current_batch",       # Optional[List[int]]
+        "classified",               # List[dict] — output of classify_cards()
+        "sell_ids",                 # List[int] — local_ids selected for removal
+        "rarity_filter",            # Optional[str]
+        "dupes_only",               # bool
+        "guide_message_id",         # message we edit with progress
+        "created",                  # float (monotonic)
+        "last_active",              # float (monotonic)
+        "batch_queue",              # List[List[int]] — remaining batches to execute
+        "current_batch",            # Optional[List[int]]
+        "series_review_series_id",  # Optional[int] — protected series currently being reviewed
+        "series_review_index",      # int — current card index within that series
     )
 
     def __init__(self, user_id: int, channel_id: int, guild_id: int):
@@ -93,6 +95,8 @@ class AuditSession:
         self.last_active = time.monotonic()
         self.batch_queue: List[List[int]] = []
         self.current_batch: Optional[List[int]] = None
+        self.series_review_series_id = None
+        self.series_review_index = 0
 
     def touch(self) -> None:
         self.last_active = time.monotonic()
@@ -301,6 +305,392 @@ class AuditMixin:
         review["status"] = "complete"
         protection["protected_series"][str(series_id)] = review
         await self._save_audit_protection(user_id, protection)
+
+    async def _audit_show_series_review(
+        self,
+        ctx: commands.Context,
+    ) -> None:
+        """Show the next protected-series card that needs a decision."""
+        session = self._audit_session(ctx.author.id)
+        if not session or not session.classified:
+            await ctx.reply(
+                "No active audit. Run `..wg audit start` or `..wg audit classify` first.",
+                mention_author=False,
+            )
+            return
+
+        raw_cards = await self._audit_active_cards(session.user_id)
+        enriched = self._enrich_with_catalog(raw_cards)
+
+        protection = await self._audit_protection(session.user_id)
+        reviews = protection.get("protected_series", {})
+
+        # Find protected-series cards whose identity has no saved decision.
+        pending_by_series: Dict[int, List[Dict[str, Any]]] = {}
+
+        for card in enriched:
+            raw_series_id = _series_id_for(card)
+            if raw_series_id is None:
+                continue
+
+            series_id = int(raw_series_id)
+            if series_id not in PROTECTED_SERIES_IDS:
+                continue
+
+            review = reviews.get(str(series_id), {})
+            decisions = review.get("decisions", {})
+
+            if _card_identity(card) in decisions:
+                continue
+
+            pending_by_series.setdefault(series_id, []).append(card)
+
+        if not pending_by_series:
+            session.series_review_series_id = None
+            session.series_review_index = 0
+
+            await ctx.reply(
+                "All protected-series cards already have decisions.\n"
+                "Run `..wg audit classify` again, then `..wg audit sell`.",
+                mention_author=False,
+            )
+            return
+
+        # Continue the current series if possible.
+        current_series = session.series_review_series_id
+
+        if (
+            current_series is not None
+            and current_series in pending_by_series
+        ):
+            series_id = current_series
+        else:
+            series_id = sorted(pending_by_series)[0]
+            session.series_review_series_id = series_id
+            session.series_review_index = 0
+
+        cards = pending_by_series[series_id]
+
+        if session.series_review_index >= len(cards):
+            session.series_review_index = 0
+
+        card = cards[session.series_review_index]
+
+        series_name = (
+            self._series_index.get(str(series_id))
+            or self._series_index.get(series_id)
+            or f"Series {series_id}"
+        )
+
+        await self._send_series_review_card(
+            ctx.channel,
+            session,
+            series_id,
+            series_name,
+            card,
+            len(cards),
+        )
+
+    async def _send_series_review_card(
+        self,
+        channel: discord.abc.Messageable,
+        session: AuditSession,
+        series_id: int,
+        series_name: str,
+        card: Dict[str, Any],
+        pending_count: int,
+    ) -> None:
+        """Render one protected-series card with Keep/Sell buttons."""
+        skill = card.get("skill")
+        luck = card.get("luck")
+
+        skill_text = f"{float(skill):.2f}" if skill is not None else "?"
+        luck_text = str(luck) if luck is not None else "?"
+
+        content = (
+            f"## Protected Series Review\n"
+            f"**Series:** `{series_id}` {series_name}\n"
+            f"**Card:** `{card.get('local_id', '?')}` "
+            f"**{card.get('name', 'Unknown')}** "
+            f"`[{_rarity_symbol(card).upper()}]`\n"
+            f"Skill `{skill_text}` · Luck `{luck_text}`\n\n"
+            f"-# `{pending_count}` undecided card(s) remain in this series.\n"
+            f"-# You must keep at least one card from every protected series."
+        )
+
+        local_id = card.get("local_id")
+        if local_id is None:
+            return
+
+        components = [
+            {
+                "type": 10,
+                "content": content,
+            },
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2,
+                        "style": 3,
+                        "label": "Keep",
+                        "custom_id": (
+                            f"nebwg:auditseries:{session.user_id}:"
+                            f"{series_id}:keep:{int(local_id)}"
+                        ),
+                    },
+                    {
+                        "type": 2,
+                        "style": 4,
+                        "label": "Sell",
+                        "custom_id": (
+                            f"nebwg:auditseries:{session.user_id}:"
+                            f"{series_id}:sell:{int(local_id)}"
+                        ),
+                    },
+                ],
+            },
+        ]
+
+        await self._send_channel_v2_components(
+            channel,
+            components,
+        )
+
+    @commands.Cog.listener("on_interaction")
+    async def audit_on_interaction(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        """Handle protected-series Keep/Sell buttons."""
+        data = interaction.data or {}
+        custom_id = str(data.get("custom_id") or "")
+
+        match = re.fullmatch(
+            r"nebwg:auditseries:(\d+):(\d+):(keep|sell):(\d+)",
+            custom_id,
+        )
+        if not match:
+            return
+
+        user_id = int(match.group(1))
+        series_id = int(match.group(2))
+        decision = match.group(3)
+        local_id = int(match.group(4))
+
+        if interaction.user.id != user_id:
+            await interaction.response.send_message(
+                "This audit review belongs to someone else.",
+                ephemeral=True,
+            )
+            return
+
+        session = self._audit_session(user_id)
+        if not session or not session.classified:
+            await interaction.response.send_message(
+                "This audit session has expired. Re-run the audit.",
+                ephemeral=True,
+            )
+            return
+
+        raw_cards = await self._audit_active_cards(user_id)
+        enriched = self._enrich_with_catalog(raw_cards)
+
+        card = next(
+            (
+                c for c in enriched
+                if c.get("local_id") is not None
+                and int(c["local_id"]) == local_id
+            ),
+            None,
+        )
+
+        if card is None:
+            await interaction.response.send_message(
+                "That card is no longer present at this local ID. "
+                "Re-run the audit before continuing.",
+                ephemeral=True,
+            )
+            return
+
+        actual_series = _series_id_for(card)
+
+        if actual_series is None or int(actual_series) != series_id:
+            await interaction.response.send_message(
+                "That card no longer belongs to the reviewed series. "
+                "Re-run the audit.",
+                ephemeral=True,
+            )
+            return
+
+        # A sell decision is only valid if another distinct card identity
+        # will remain in this protected series.
+        if decision == "sell":
+            series_cards = [
+                c for c in enriched
+                if _series_id_for(c) == str(series_id)
+            ]
+
+            protection = await self._audit_protection(user_id)
+            review = protection.get("protected_series", {}).get(
+                str(series_id),
+                {},
+            )
+            decisions = review.get("decisions", {})
+
+            keepable_identities = {
+                _card_identity(c)
+                for c in series_cards
+                if (
+                    _card_identity(c) != _card_identity(card)
+                    and decisions.get(_card_identity(c), {}).get("decision")
+                    == "keep"
+                )
+            }
+
+            undecided_other_identities = {
+                _card_identity(c)
+                for c in series_cards
+                if (
+                    _card_identity(c) != _card_identity(card)
+                    and _card_identity(c) not in decisions
+                )
+            }
+
+            if not keepable_identities and not undecided_other_identities:
+                await interaction.response.send_message(
+                    "You cannot sell this card because it is the "
+                    "last remaining representative of this protected series.",
+                    ephemeral=True,
+                )
+                return
+
+        await self._record_series_decision(
+            user_id,
+            str(series_id),
+            card,
+            decision,
+        )
+
+        # Rebuild the classification immediately so the audit's SELL list
+        # reflects the decision.
+        await self._audit_do_classify(
+            session,
+            interaction.channel,
+        )
+
+        # Find what still needs review.
+        raw_cards = await self._audit_active_cards(user_id)
+        enriched = self._enrich_with_catalog(raw_cards)
+        protection = await self._audit_protection(user_id)
+        reviews = protection.get("protected_series", {})
+
+        pending_by_series: Dict[int, List[Dict[str, Any]]] = {}
+
+        for candidate in enriched:
+            sid = _series_id_for(candidate)
+            if sid is None:
+                continue
+
+            sid_int = int(sid)
+            if sid_int not in PROTECTED_SERIES_IDS:
+                continue
+
+            review = reviews.get(str(sid_int), {})
+            decisions = review.get("decisions", {})
+
+            if _card_identity(candidate) not in decisions:
+                pending_by_series.setdefault(sid_int, []).append(candidate)
+
+        if not pending_by_series:
+            session.series_review_series_id = None
+            session.series_review_index = 0
+
+            await interaction.response.send_message(
+                "Protected-series review complete.\n"
+                "Run `..wg audit sell` to review the resulting removal list.",
+                ephemeral=True,
+            )
+            return
+
+        if series_id in pending_by_series:
+            next_series_id = series_id
+        else:
+            next_series_id = sorted(pending_by_series)[0]
+
+        session.series_review_series_id = next_series_id
+        session.series_review_index = 0
+
+        next_cards = pending_by_series[next_series_id]
+        next_card = next_cards[0]
+
+        series_name = (
+            self._series_index.get(str(next_series_id))
+            or self._series_index.get(next_series_id)
+            or f"Series {next_series_id}"
+        )
+
+        payload = {
+            "flags": V2_FLAG,
+            "allowed_mentions": {"parse": []},
+            "components": [{
+                "type": 17,
+                "components": [
+                    {
+                        "type": 10,
+                        "content": (
+                            f"## Protected Series Review\n"
+                            f"**Series:** `{next_series_id}` {series_name}\n"
+                            f"**Card:** `{next_card.get('local_id', '?')}` "
+                            f"**{next_card.get('name', 'Unknown')}** "
+                            f"`[{_rarity_symbol(next_card).upper()}]`\n"
+                            f"Skill `{next_card.get('skill', '?')}` · "
+                            f"Luck `{next_card.get('luck', '?')}`\n\n"
+                            f"-# `{len(next_cards)}` undecided card(s) remain.\n"
+                            f"-# You must keep at least one card from every protected series."
+                        ),
+                    },
+                    {
+                        "type": 1,
+                        "components": [
+                            {
+                                "type": 2,
+                                "style": 3,
+                                "label": "Keep",
+                                "custom_id": (
+                                    f"nebwg:auditseries:{user_id}:"
+                                    f"{next_series_id}:keep:{int(next_card['local_id'])}"
+                                ),
+                            },
+                            {
+                                "type": 2,
+                                "style": 4,
+                                "label": "Sell",
+                                "custom_id": (
+                                    f"nebwg:auditseries:{user_id}:"
+                                    f"{next_series_id}:sell:{int(next_card['local_id'])}"
+                                ),
+                            },
+                        ],
+                    },
+                ],
+            }],
+        }
+
+        route = Route(
+            "POST",
+            "/interactions/{interaction_id}/{interaction_token}/callback",
+            interaction_id=interaction.id,
+            interaction_token=interaction.token,
+        )
+
+        await self.bot.http.request(
+            route,
+            json={
+                "type": 7,
+                "data": payload,
+            },
+        )
 
     def _series_needs_review(
         self,
@@ -1062,6 +1452,7 @@ class AuditMixin:
           `..wg audit sell <rarity>`   — e.g. `sell α`
           `..wg audit sell dupes`      — duplicates only
           `..wg audit review`          — inspect REVIEW / UNKNOWN cards
+          `..wg audit series`          — review protected-series cards
 
         To skip event harvesting (no event cards):
           `..wg audit classify`
@@ -1147,6 +1538,11 @@ class AuditMixin:
     async def wgaudit_review(self, ctx: commands.Context) -> None:
         """Show cards in the REVIEW or UNKNOWN category."""
         await self._audit_show_review(ctx)
+
+    @wgaudit.command(name="series")
+    async def wgaudit_series(self, ctx: commands.Context) -> None:
+        """Review protected-series cards one at a time."""
+        await self._audit_show_series_review(ctx)
 
     @wgaudit.command(name="confirm")
     async def wgaudit_confirm(
