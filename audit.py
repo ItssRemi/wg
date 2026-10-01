@@ -771,6 +771,73 @@ class AuditMixin:
 
     # ── Stage 3: confirm & execute ────────────────────────────────────────
 
+    async def _audit_revalidate_ids(
+        self,
+        session: AuditSession,
+        ids_to_remove: List[int],
+    ) -> Tuple[bool, List[str]]:
+        """Verify that removal IDs still refer to the cards we audited.
+
+        Waifugami local IDs can change after cards are removed. Never issue
+        `.rm` against an ID unless the live collection still matches the
+        audited card identity.
+        """
+        live_cards = await self._audit_active_cards(session.user_id)
+        live_by_id: Dict[int, Dict[str, Any]] = {}
+
+        for card in live_cards:
+            local_id = card.get("local_id")
+            if local_id is None:
+                continue
+
+            try:
+                live_by_id[int(local_id)] = card
+            except (TypeError, ValueError):
+                continue
+
+        classified_by_id: Dict[int, Dict[str, Any]] = {
+            int(entry["local_id"]): entry
+            for entry in session.classified
+            if entry.get("local_id") is not None
+        }
+
+        mismatches: List[str] = []
+
+        for local_id in ids_to_remove:
+            audited = classified_by_id.get(local_id)
+            live = live_by_id.get(local_id)
+
+            if audited is None:
+                mismatches.append(
+                    f"`{local_id}` was not present in the audit."
+                )
+                continue
+
+            if live is None:
+                mismatches.append(
+                    f"`{local_id}` ({audited['name']}) is no longer in the collection."
+                )
+                continue
+
+            audited_name = str(audited.get("name", "")).strip().casefold()
+            live_name = str(live.get("name", "")).strip().casefold()
+
+            audited_rarity = str(
+                audited.get("rarity_symbol", "")
+            ).strip().casefold()
+            live_rarity = str(
+                live.get("rarity", "")
+            ).strip().casefold()
+
+            if audited_name != live_name or audited_rarity != live_rarity:
+                mismatches.append(
+                    f"`{local_id}` changed from "
+                    f"**{audited['name']} [{audited['rarity_symbol']}]** "
+                    f"to **{live.get('name', '?')} [{live.get('rarity', '?')}]**."
+                )
+
+        return not mismatches, mismatches
+
     async def _audit_confirm(
         self,
         ctx: commands.Context,
@@ -798,7 +865,7 @@ class AuditMixin:
                 mention_author=False,
             )
             return
-        
+
         if session.parse_failures:
             await ctx.reply(
                 f"⚠️ This audit found `{session.parse_failures}` "
@@ -824,6 +891,29 @@ class AuditMixin:
                 f"⚠️ {len(protected_ids)} of the selected IDs are marked **KEEP** "
                 f"(`{', '.join(str(x) for x in protected_ids[:10])}{'…' if len(protected_ids) > 10 else ''}`). "
                 "Aborting — please re-run `..wg audit sell` and try again.",
+                mention_author=False,
+            )
+            return
+
+        valid, mismatches = await self._audit_revalidate_ids(
+            session,
+            ids_to_remove,
+        )
+
+        if not valid:
+            preview = "\n".join(f"- {item}" for item in mismatches[:10])
+            extra = (
+                f"\n-# ... and {len(mismatches) - 10} more."
+                if len(mismatches) > 10
+                else ""
+            )
+
+            await ctx.reply(
+                "🛑 **Removal aborted.** Some local IDs no longer refer "
+                "to the same cards that were audited.\n\n"
+                f"{preview}"
+                f"{extra}\n\n"
+                "Re-run the audit before attempting removal again.",
                 mention_author=False,
             )
             return
