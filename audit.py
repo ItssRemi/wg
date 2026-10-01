@@ -785,6 +785,15 @@ class AuditMixin:
                 mention_author=False,
             )
             return
+        
+        if session.parse_failures:
+            await ctx.reply(
+                f"⚠️ This audit found `{session.parse_failures}` "
+                "card-list line(s) that could not be parsed. "
+                "Removal is blocked until the audit is re-run cleanly.",
+                mention_author=False,
+            )
+            return
 
         # Validate: make sure none of the IDs slipped into a protected
         # disposition since the audit was run (e.g. user re-ran in between).
