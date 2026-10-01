@@ -172,6 +172,23 @@ def _card_identity(card: Dict[str, Any]) -> str:
     return f"{name}|{rarity}"
 
 
+def _series_card_identity(card: Dict[str, Any]) -> str:
+    """Stable identity for one physical card during protected-series review.
+
+    Global IDs identify individual cards across local-list reindexing.
+    Fall back to name+rarity when an older stored card has no global ID.
+    """
+    global_id = card.get("global_id")
+
+    if global_id is not None:
+        try:
+            return f"global:{int(global_id)}"
+        except (TypeError, ValueError):
+            pass
+
+    return _card_identity(card)
+
+
 def _event_identity_set(
     event_cards: Dict[str, Dict[str, Any]],
 ) -> Set[str]:
@@ -227,7 +244,7 @@ def series_review_decision(
     Returns "keep", "sell", or None (no decision recorded yet).
     """
     decisions = series_review.get("decisions", {})
-    identity = _card_identity(card)
+    identity = _series_card_identity(card)
     entry = decisions.get(identity)
     if entry is None:
         return None
