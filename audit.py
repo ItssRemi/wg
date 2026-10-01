@@ -28,7 +28,7 @@ from .audit_engine import (
     WAIFUGAMI_ID, V2_FLAG,
     classify_cards, _chunk, _is_locked, _skill, _luck,
     _rarity_symbol, _dp_for_card, _shards_for_card,
-    _card_identity, _series_id_for,
+    _card_identity, _series_card_identity, _series_id_for,
 )
 
 def _card_snapshot(
@@ -285,7 +285,7 @@ class AuditMixin:
         review.setdefault("decisions", {})
         review.setdefault("status", "in_progress")
 
-        identity = _card_identity(card)
+        identity = _series_card_identity(card)
 
         review["decisions"][identity] = {
             "decision": decision,
@@ -340,7 +340,7 @@ class AuditMixin:
             review = reviews.get(str(series_id), {})
             decisions = review.get("decisions", {})
 
-            if _card_identity(card) in decisions:
+            if _series_card_identity(card) in decisions:
                 continue
 
             pending_by_series.setdefault(series_id, []).append(card)
@@ -540,20 +540,21 @@ class AuditMixin:
 
             keepable_identities = {
                 _card_identity(c)
-                for c in series_cards
+                c for c in series_cards
                 if (
-                    _card_identity(c) != _card_identity(card)
-                    and decisions.get(_card_identity(c), {}).get("decision")
-                    == "keep"
+                    _series_card_identity(c) != _series_card_identity(card)
+                    and decisions.get(
+                        _series_card_identity(c), {}
+                    ).get("decision") == "keep"
                 )
             }
 
             undecided_other_identities = {
                 _card_identity(c)
-                for c in series_cards
+                c for c in series_cards
                 if (
-                    _card_identity(c) != _card_identity(card)
-                    and _card_identity(c) not in decisions
+                    _series_card_identity(c) != _series_card_identity(card)
+                    and _series_card_identity(c) not in decisions
                 )
             }
 
@@ -599,7 +600,7 @@ class AuditMixin:
             review = reviews.get(str(sid_int), {})
             decisions = review.get("decisions", {})
 
-            if _card_identity(candidate) not in decisions:
+            if _series_card_identity(candidate) not in decisions:
                 pending_by_series.setdefault(sid_int, []).append(candidate)
 
         if not pending_by_series:
