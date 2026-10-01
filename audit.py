@@ -478,6 +478,7 @@ class AuditMixin:
         decision = match.group(3)
         local_id = int(match.group(4))
 
+        # Perform cheap guard checks before acknowledging the interaction.
         if interaction.user.id != user_id:
             await interaction.response.send_message(
                 "This audit review belongs to someone else.",
@@ -493,6 +494,11 @@ class AuditMixin:
             )
             return
 
+        # Acknowledge the button immediately. The remaining work performs
+        # collection/database reads and classification, which can exceed
+        # Discord's interaction response deadline.
+        await interaction.response.defer_update()
+
         raw_cards = await self._audit_active_cards(user_id)
         enriched = self._enrich_with_catalog(raw_cards)
 
@@ -506,7 +512,7 @@ class AuditMixin:
         )
 
         if card is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "That card is no longer present at this local ID. "
                 "Re-run the audit before continuing.",
                 ephemeral=True,
@@ -516,7 +522,7 @@ class AuditMixin:
         actual_series = _series_id_for(card)
 
         if actual_series is None or int(actual_series) != series_id:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "That card no longer belongs to the reviewed series. "
                 "Re-run the audit.",
                 ephemeral=True,
@@ -539,19 +545,20 @@ class AuditMixin:
             decisions = review.get("decisions", {})
 
             keepable_identities = {
-                _card_identity(c)
-                c for c in series_cards
+                _series_card_identity(c)
+                for c in series_cards
                 if (
                     _series_card_identity(c) != _series_card_identity(card)
                     and decisions.get(
-                        _series_card_identity(c), {}
+                        _series_card_identity(c),
+                        {},
                     ).get("decision") == "keep"
                 )
             }
 
             undecided_other_identities = {
-                _card_identity(c)
-                c for c in series_cards
+                _series_card_identity(c)
+                for c in series_cards
                 if (
                     _series_card_identity(c) != _series_card_identity(card)
                     and _series_card_identity(c) not in decisions
@@ -559,7 +566,7 @@ class AuditMixin:
             }
 
             if not keepable_identities and not undecided_other_identities:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "You cannot sell this card because it is the "
                     "last remaining representative of this protected series.",
                     ephemeral=True,
@@ -594,6 +601,7 @@ class AuditMixin:
                 continue
 
             sid_int = int(sid)
+
             if sid_int not in PROTECTED_SERIES_IDS:
                 continue
 
@@ -607,7 +615,7 @@ class AuditMixin:
             session.series_review_series_id = None
             session.series_review_index = 0
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Protected-series review complete.\n"
                 "Run `..wg audit sell` to review the resulting removal list.",
                 ephemeral=True,
@@ -678,6 +686,9 @@ class AuditMixin:
             }],
         }
 
+        # The interaction has already been acknowledged with defer_update().
+        # PATCH the original interaction response directly because this is
+        # a raw Components V2 payload.
         route = Route(
             "PATCH",
             "/webhooks/{application_id}/{interaction_token}/messages/@original",
