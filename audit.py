@@ -316,20 +316,19 @@ class AuditMixin:
     @staticmethod
     def _parse_event_list_page(
         embed: discord.Embed,
-    ) -> Tuple[Optional[str], int, int, List[Tuple[int, str, str]]]:
+    ) -> Tuple[Optional[str], int, int, List[Tuple[int, str, str, str]]]:
         """Parse one page of `.l -event all` output.
 
         Returns (owner_name, page_index, total_pages, entries) where:
-          - page_index  is 0-based (Waifugami natively sends "Page 0 of 107",
-                        "Page 1 of 107", … "Page 107 of 107")
-          - total_pages is the value after "of" (e.g. 107 means pages 0..107,
-                        i.e. 108 total pages)
-          - entries     = [(local_id, rarity_symbol, name), ...]
+          - page_index  is 0-based.
+          - total_pages is the value after "of".
+          - entries     = [
+                (local_id, status_emoji, rarity_symbol, name),
+                ...
+            ]
 
-        Waifugami pages are already 0-based — no conversion needed.
-        The completion check is:
-            seen_pages == set(range(total_pages + 1))
-        because pages run from 0 through total_pages inclusive.
+        The status emoji is preserved because Waifugami uses it for
+        meaningful card state and the emoji set is not fixed.
         """
         title = embed.title or ""
         m = LIST_TITLE_RE.match(title)
@@ -344,18 +343,25 @@ class AuditMixin:
             fm = FINAL_PAGE_FIELD_NAME_RE.search(field.name or "")
             if fm:
                 # Pages are already 0-based in Waifugami's embed field.
-                page_index  = int(fm.group(1))
+                page_index = int(fm.group(1))
                 total_pages = int(fm.group(2))
                 break
 
-        entries: List[Tuple[int, str, str]] = []
+        entries: List[Tuple[int, str, str, str]] = []
+
         for line in (embed.description or "").splitlines():
-            lm = LIST_ENTRY_RE.match(line.strip())
+            raw_line = line.strip()
+            lm = LIST_ENTRY_RE.match(raw_line)
+
             if lm:
                 local_id = int(lm.group(1))
-                rarity   = lm.group(2).strip()
-                name     = lm.group(3).strip()
-                entries.append((local_id, rarity, name))
+                status_emoji = (lm.group(2) or "").strip()
+                rarity = lm.group(3).strip()
+                name = lm.group(4).strip()
+
+                entries.append(
+                    (local_id, status_emoji, rarity, name)
+                )
 
         return owner_name, page_index, total_pages, entries
 
@@ -424,7 +430,7 @@ class AuditMixin:
         session.touch()
         session.list_message_id = message.id
 
-        for local_id, rarity, name in entries:
+        for local_id, status_emoji, rarity, name in entries:
             session.event_cards[str(local_id)] = _card_snapshot(
                 local_id=local_id,
                 name=name,
