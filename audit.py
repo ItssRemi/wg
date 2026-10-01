@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import discord
 from discord import app_commands
+from discord.http import Route
 from redbot.core import commands
 
 from .audit_engine import (

@@ -342,7 +342,7 @@ def classify_cards(
             reasons.append(REASON_OMEGA)
 
         else:
-            # ── 5. Protected series — consult persisted user decisions ────────
+            # 5. Protected series, consult persisted user decisions.
             if sid_int is not None and sid_int in PROTECTED_SERIES_IDS:
                 series_review = persistent_series_reviews.get(str(sid_int), {})
                 decision = series_review_decision(card, series_review)
@@ -350,12 +350,13 @@ def classify_cards(
                 if decision == "keep":
                     disposition = KEEP
                     reasons.append(REASON_SERIES_KEEP)
+
                 elif decision == "sell":
-                    # Explicit sell decision — falls through to normal
-                    # evaluation below; tag it so the sell list is clear.
+                    disposition = SELL
                     reasons.append(REASON_SERIES_SELL)
+
                 else:
-                    # No decision recorded yet → must review before removing.
+                    # No decision recorded yet, must review before removing.
                     disposition = REVIEW
                     reasons.append(REASON_SERIES_UNREVIEWED)
 
