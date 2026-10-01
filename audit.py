@@ -433,13 +433,7 @@ class AuditMixin:
 
         # page_index is 0-based; record it and update total if known.
         session.seen_pages.add(page_index)
-        if total_pages > 0:
-            session.total_pages = total_pages
-
-        # Complete only when EVERY expected page has been captured.
-        # Pages run 0 through total_pages inclusive, so the full set is
-        # range(total_pages + 1).  We never short-circuit on "current == last"
-        # alone — a missed edit would produce an incomplete event catalogue.
+        session.total_pages = total_pages
         all_seen = (
             session.total_pages is not None
             and session.seen_pages == set(range(session.total_pages + 1))
