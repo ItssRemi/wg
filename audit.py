@@ -577,11 +577,20 @@ class AuditMixin:
 
         persistent_event_count = len(event_cards)
 
+        parser_status = (
+            "⚠️ **PARSER FAILURES** — "
+            f"`{session.parse_failures}` card-list line(s) could not be parsed. "
+            "Removal is blocked until the audit is re-run cleanly."
+            if session.parse_failures
+            else "🟢 **PARSER** — `0` failures, all card-list lines parsed."
+        )
+
         summary = (
             f"## Audit Report\n"
             f"-# {len(classified)} cards evaluated  ·  "
             f"{len(session.event_cards)} event cards learned this scan  ·  "
             f"{persistent_event_count} remembered permanently\n\n"
+            f"{parser_status}\n\n"
             f"🟢 **KEEP** — `{counts[KEEP]}` cards protected\n"
             f"🟡 **REVIEW** — `{counts[REVIEW]}` cards need your attention\n"
             f"🔴 **SELL** — `{counts[SELL]}` cards ready for removal\n"
@@ -594,7 +603,11 @@ class AuditMixin:
             f"Use `..wg audit review` to inspect REVIEW cards.\n"
             f"Use `..wg audit sell dupes` to limit to duplicates only.\n"
             f"Use `..wg audit sell <rarity>` to filter (e.g. `sell α`).\n"
-            f"Use `..wg audit confirm` to execute removal after reviewing."
+            + (
+                "Removal is currently blocked because the harvest had parser failures."
+                if session.parse_failures
+                else "Use `..wg audit confirm` to execute removal after reviewing."
+            )
         )
 
         if channel:
