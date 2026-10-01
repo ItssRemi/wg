@@ -261,8 +261,8 @@ class AuditMixin:
         """Persist a keep/sell decision for one card identity in a series.
 
         decision must be "keep" or "sell".
-        This is called immediately when the user states a decision — not at
-        the end of the session — so a restart never loses progress.
+        This is called immediately when the user states a decision, not at
+        the end of the session, so a restart never loses progress.
         """
         protection = await self._audit_protection(user_id)
         series_reviews = protection["protected_series"]
@@ -274,16 +274,18 @@ class AuditMixin:
         review.setdefault("status", "in_progress")
 
         identity = _card_identity(card)
+
         review["decisions"][identity] = {
-            "decision":     decision,
-            "name":         card.get("name", "Unknown"),
-            "rarity":       _rarity_symbol(card),
+            "decision": decision,
+            "name": card.get("name", "Unknown"),
+            "rarity": _rarity_symbol(card),
             "last_seen_id": card.get("local_id"),
-            "decided_at":   time.time(),
+            "decided_at": time.time(),
         }
+
         protection["protected_series"][str(series_id)] = review
         await self._save_audit_protection(user_id, protection)
-
+        
     async def _mark_series_complete(self, user_id: int, series_id: str) -> None:
         """Mark a series review as complete once all decisions are recorded."""
         protection = await self._audit_protection(user_id)
