@@ -36,11 +36,17 @@ def _card_snapshot(
     local_id: Optional[int],
     name: str,
     rarity: str,
+    status_emoji: Optional[str] = None,
     global_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     return {
         "name": str(name).strip(),
         "rarity": str(rarity).strip().lower(),
+        "status_emoji": (
+            str(status_emoji).strip()
+            if status_emoji
+            else None
+        ),
         "last_seen_id": int(local_id) if local_id is not None else None,
         "global_id": int(global_id) if global_id is not None else None,
         "last_seen_at": time.time(),
@@ -435,6 +441,7 @@ class AuditMixin:
                 local_id=local_id,
                 name=name,
                 rarity=rarity,
+                status_emoji=status_emoji,
             )
 
         # page_index is 0-based; record it and update total if known.
