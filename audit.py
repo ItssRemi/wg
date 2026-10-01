@@ -62,7 +62,7 @@ class AuditSession:
         "event_cards",              # Dict[str, Dict[str, Any]] — local_id → snapshot, accumulated across all pages
         "seen_pages",               # Set[int]
         "total_pages",              # int | None
-        "parse_failures"
+        "parse_failures",           # int — malformed list lines seen during harvest
         "classified",               # List[dict] — output of classify_cards()
         "sell_ids",                 # List[int] — local_ids selected for removal
         "rarity_filter",            # Optional[str]
