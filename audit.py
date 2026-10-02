@@ -3,6 +3,35 @@
 Pure classification logic lives in audit_engine.py (no bot imports there).
 This file adds AuditSession, AuditMixin, all Red commands/listeners, and the
 persistent JSONL audit log.
+ 
+Key fixes vs previous version
+──────────────────────────────
+1.  Pagination: Waifugami sends ONE message then EDITs it for every subsequent
+    page.  The harvest therefore listens to on_message_edit (pages 1+) as well
+    as on_message (page 0).  The on_raw_message_edit always fires alongside
+    on_message_edit but its payload carries no embeds; the guard
+    `if not after.embeds` handles it for free.
+ 
+2.  Deduplication: the seen_pages set in HarvestStats rejects duplicate page
+    updates so double-firing of raw+normal edit events cannot double-count cards.
+ 
+3.  parse_failures is incremented AFTER the session is located (the previous
+    code incremented it before `session` was assigned, causing AttributeError).
+ 
+4.  The tuple unpack from _parse_event_list_page previously expected 4 values
+    but the function now returns a ParsedPage object — no tuple mismatch.
+ 
+5.  Revalidation: before any .rm is issued, the live collection is reloaded and
+    every target local_id is verified against its audited name+rarity.  Any
+    mismatch aborts the batch.
+ 
+6.  JSONL audit log: every completed audit and every destructive action is
+    appended to a per-guild JSONL file in the cog's data directory.  Logging
+    failure never blocks cleanup; it is reported but does not abort.
+ 
+7.  Series review command: `..wg audit series` is now wired up.
+ 
+8.  ALL classification reasons are preserved (multi-reason cards are supported).
 """
  
 from __future__ import annotations
@@ -84,6 +113,7 @@ class AuditSession:
         "current_batch",    # Optional[List[int]]
         "series_review_series_id",
         "series_review_index",
+        "harvested",            # bool — True only when a real harvest completed
     )
  
     def __init__(self, user_id: int, channel_id: int, guild_id: int):
@@ -106,6 +136,7 @@ class AuditSession:
         self.current_batch:   Optional[List[int]] = None
         self.series_review_series_id: Optional[int] = None
         self.series_review_index: int = 0
+        self.harvested:       bool = False
  
     def touch(self) -> None:
         self.last_active = time.monotonic()
@@ -588,28 +619,18 @@ class AuditMixin:
             return
  
         # Safety: don't allow selling the last representative.
+        # Use session.classified as the source of truth — it reflects all
+        # protection rules (locked, event, sigma, omega, high stats, etc.),
+        # not just the series-review decisions dict.
         if decision == "sell":
-            series_cards = [
-                c for c in enriched if _series_id_for(c) == str(series_id)
-            ]
-            protection = await self._audit_protection(user_id)
-            review     = protection.get("protected_series", {}).get(str(series_id), {})
-            decisions  = review.get("decisions", {})
- 
             this_identity = _series_card_identity(card)
-            keep_others = {
-                _series_card_identity(c)
-                for c in series_cards
-                if _series_card_identity(c) != this_identity
-                and decisions.get(_series_card_identity(c), {}).get("decision") == "keep"
-            }
-            undecided_others = {
-                _series_card_identity(c)
-                for c in series_cards
-                if _series_card_identity(c) != this_identity
-                and _series_card_identity(c) not in decisions
-            }
-            if not keep_others and not undecided_others:
+            other_survivors = [
+                e for e in session.classified
+                if e.get("series_id") == str(series_id)
+                and _series_card_identity(e["card"]) != this_identity
+                and e["disposition"] != SELL
+            ]
+            if not other_survivors:
                 await interaction.followup.send(
                     "You cannot sell this card because it is the last remaining "
                     "representative of this protected series.",
@@ -731,6 +752,19 @@ class AuditMixin:
  
     async def _audit_start(self, ctx: commands.Context) -> None:
         user_id = ctx.author.id
+        # Reject if another user's harvest is already active in this channel.
+        for _existing in self._audit_sessions.values():
+            if (
+                _existing.channel_id == ctx.channel.id
+                and _existing.phase == "harvesting"
+                and _existing.user_id != user_id
+            ):
+                await ctx.reply(
+                    "Another audit is already harvesting in this channel. "
+                    "It must complete or be cancelled before starting a new one.",
+                    mention_author=False,
+                )
+                return
         self._audit_cancel(user_id)
         session = AuditSession(
             user_id    = user_id,
@@ -785,6 +819,28 @@ class AuditMixin:
         if session is None:
             return
  
+        # Verify the embed's owner_name matches the audit user's Discord
+        # account username (the unique handle Waifugami uses in the title).
+        # We use discord.utils.find against member.name — the account username
+        # field — not display_name or nick, which are non-unique.
+        # If the guild is uncached or the member left, fall through and accept
+        # by channel as before (fail-open is safer than dropping valid pages).
+        guild = self.bot.get_guild(session.guild_id)
+        if guild is not None:
+            member = discord.utils.find(
+                lambda m: m.name.casefold() == page.owner_name.casefold(),
+                guild.members,
+            )
+            if member is not None and member.id != session.user_id:
+                # List belongs to a different user — reject this page.
+                log.debug(
+                    "[WGA][session=%s] rejected page: owner_name=%r belongs to"
+                    " user %d, not audit user %d",
+                    session.session_id, page.owner_name,
+                    member.id, session.user_id,
+                )
+                return
+ 
         session.touch()
         session.list_message_id = message.id
  
@@ -821,6 +877,7 @@ class AuditMixin:
         channel  = self.bot.get_channel(session.channel_id)
  
         if all_seen:
+            session.harvested = True
             await self._persist_event_cards(session.user_id, session.event_cards)
             await self._audit_do_classify(session, channel)
         else:
@@ -903,7 +960,9 @@ class AuditMixin:
         hs = session.harvest_stats
  
         # Block indicator
-        if hs.cleanup_blocked:
+        # Only block on harvest stats when a harvest was actually attempted.
+        # ..wg audit classify skips harvesting and uses the persistent store.
+        if session.harvested and hs.cleanup_blocked:
             block_lines = ["⛔ **CLEANUP BLOCKED** — reasons:"]
             missing = hs.pages_missing
             if missing:
@@ -919,8 +978,10 @@ class AuditMixin:
             if not hs.harvest_complete and hs.expected_page_count is None:
                 block_lines.append("  · Harvest did not complete (unknown total pages)")
             block_status = "\n".join(block_lines)
-        else:
+        elif session.harvested:
             block_status = "🟢 **CLEANUP AVAILABLE** — harvest complete, no parse failures"
+        else:
+            block_status = "🟢 **CLEANUP AVAILABLE** — using remembered event cards"
  
         harvest_summary = "\n".join(hs.summary_lines())
         persistent_count = len(event_cards)
@@ -948,7 +1009,7 @@ class AuditMixin:
                 "or `..wg audit review` to inspect all REVIEW/UNKNOWN cards."
             )
  
-        if not hs.cleanup_blocked and counts[SELL]:
+        if not (session.harvested and hs.cleanup_blocked) and counts[SELL]:
             summary += (
                 f"\n\nRun `..wg audit sell` to preview removal candidates, "
                 "then `..wg audit confirm` to execute."
@@ -1004,7 +1065,7 @@ class AuditMixin:
  
         # Refuse to show sell candidates when cleanup is blocked.
         hs = session.harvest_stats
-        if hs.cleanup_blocked:
+        if session.harvested and hs.cleanup_blocked:
             lines = ["⛔ **Cleanup blocked** — cannot show removal candidates."]
             missing = hs.pages_missing
             if missing:
@@ -1094,7 +1155,10 @@ class AuditMixin:
             )
             return
  
-        CARDS_PER_SECTION = 20
+        # Discord caps a single type-10 text component at 4000 characters.
+        # Formatted lines vary in length, so we budget by character count rather
+        # than a fixed card-per-section number.
+        MAX_COMPONENT_CHARS = 3800  # safe margin below the 4000 hard limit
  
         def _fmt(entry: Dict[str, Any]) -> str:
             skill_str = f"{entry['skill']:.2f}" if entry["skill"] is not None else "?"
@@ -1106,19 +1170,26 @@ class AuditMixin:
                 f"-# {entry['disposition']} · {', '.join(entry['reasons'])}"
             )
  
-        header   = (
+        header = (
             f"## Review & Unknown Cards\n"
             f"-# {len(entries)} cards require manual inspection"
         )
         sections = [header]
-        chunk: List[str] = []
+ 
+        current_lines: List[str] = []
+        current_len = 0
         for entry in entries:
-            chunk.append(_fmt(entry))
-            if len(chunk) == CARDS_PER_SECTION:
-                sections.append("\n".join(chunk))
-                chunk = []
-        if chunk:
-            sections.append("\n".join(chunk))
+            line = _fmt(entry)
+            # +1 for the joining newline
+            needed = len(line) + (1 if current_lines else 0)
+            if current_lines and current_len + needed > MAX_COMPONENT_CHARS:
+                sections.append("\n".join(current_lines))
+                current_lines = []
+                current_len = 0
+            current_lines.append(line)
+            current_len += needed
+        if current_lines:
+            sections.append("\n".join(current_lines))
  
         await self._send_channel_v2_components(
             ctx.channel,
@@ -1152,8 +1223,9 @@ class AuditMixin:
             return
  
         # Block on incomplete harvest or parse failures.
+        # Only applies when a harvest was actually attempted this session.
         hs = session.harvest_stats
-        if hs.cleanup_blocked:
+        if session.harvested and hs.cleanup_blocked:
             parts = ["⛔ **Cannot execute removal — cleanup is blocked.**"]
             missing = hs.pages_missing
             if missing:
@@ -1226,11 +1298,33 @@ class AuditMixin:
                 )
                 continue
  
-            # Compare name + rarity using the same normalisation used by identity.
-            audited_ident = _card_identity(audited["card"]) if audited else None
-            live_ident    = _card_identity(live)
+            # Compare identity.  When both sides carry a global_id, use it as
+            # the primary key — it is stable across local-list reindexing.
+            # Fall back to name+rarity only when one side lacks a global_id.
+            audited_gid: Optional[int] = None
+            live_gid:    Optional[int] = None
+            if audited:
+                try:
+                    _raw_gid = audited["card"].get("global_id")
+                    if _raw_gid is not None:
+                        audited_gid = int(_raw_gid)
+                except (TypeError, ValueError):
+                    pass
+            try:
+                _raw_gid = live.get("global_id")
+                if _raw_gid is not None:
+                    live_gid = int(_raw_gid)
+            except (TypeError, ValueError):
+                pass
  
-            if audited_ident is None or audited_ident != live_ident:
+            if audited_gid is not None and live_gid is not None:
+                match = (audited_gid == live_gid)
+            else:
+                audited_ident = _card_identity(audited["card"]) if audited else None
+                live_ident    = _card_identity(live)
+                match = (audited_ident is not None and audited_ident == live_ident)
+ 
+            if not match:
                 revalidation_failures.append((
                     lid,
                     f"identity mismatch: audited={audited_ident!r} live={live_ident!r}",
