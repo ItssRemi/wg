@@ -726,8 +726,21 @@ def assert_protected_series_invariant(
                 if sid_int in PROTECTED_SERIES_IDS:
                     surviving[sid_int].append(r)
 
+    # Only flag series that actually appear in the audited collection.
+    # A protected series the user has no cards from is not a violation.
+    series_represented: Set[int] = set()
+    for r in results:
+        sid = r.get("series_id")
+        if sid is not None:
+            try:
+                sid_int = int(sid)
+            except (ValueError, TypeError):
+                continue
+            if sid_int in PROTECTED_SERIES_IDS:
+                series_represented.add(sid_int)
+
     violations = []
-    for sid in PROTECTED_SERIES_IDS:
+    for sid in series_represented:
         if not surviving.get(sid):
             violations.append(
                 f"Protected series {sid} would have NO surviving representative"
