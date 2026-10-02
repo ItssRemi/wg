@@ -515,44 +515,162 @@ class AuditMixin:
  
     async def _send_series_review_card(
         self,
-        channel:      discord.abc.Messageable,
-        session:      AuditSession,
-        series_id:    int,
-        series_name:  str,
-        card:         Dict[str, Any],
+        channel: discord.abc.Messageable,
+        session: AuditSession,
+        series_id: int,
+        series_name: str,
+        card: Dict[str, Any],
         pending_count: int,
+        all_cards: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        skill = card.get("skill")
-        luck  = card.get("luck")
-        skill_text = f"{float(skill):.2f}" if skill is not None else "?"
-        luck_text  = str(luck) if luck is not None else "?"
-        content = (
-            f"## Protected Series Review\n"
-            f"**Series:** `{series_id}` {series_name}\n"
-            f"**Card:** `{card.get('local_id', '?')}` "
-            f"**{card.get('name', 'Unknown')}** "
-            f"`[{_rarity_symbol(card).upper()}]`\n"
-            f"Skill `{skill_text}` · Luck `{luck_text}`\n\n"
-            f"-# `{pending_count}` undecided card(s) remain in this series.\n"
-            f"-# You must keep at least one card from every protected series."
-        )
+        """Send the protected-series review UI for one card."""
+
         local_id = card.get("local_id")
         if local_id is None:
             return
+
+        character_id = card.get("waifu_id")
+
+        skill = card.get("skill")
+        luck = card.get("luck")
+
+        skill_text = f"{float(skill):.2f}" if skill is not None else "?"
+        luck_text = str(luck) if luck is not None else "?"
+
+        # Find other copies of this exact catalog character in this series.
+        character_cards: List[Dict[str, Any]] = []
+
+        if all_cards:
+            for candidate in all_cards:
+                candidate_sid = _series_id_for(candidate)
+
+                if candidate_sid is None or int(candidate_sid) != series_id:
+                    continue
+
+                if character_id is not None:
+                    if candidate.get("waifu_id") != character_id:
+                        continue
+                else:
+                    if _card_identity(candidate) != _card_identity(card):
+                        continue
+
+                character_cards.append(candidate)
+
+        # Event cards are identified from the harvested event-list snapshot.
+        event_cards = []
+        event_local_ids = {
+            int(local_id_key)
+            for local_id_key in session.event_cards
+            if str(local_id_key).isdigit()
+        }
+
+        for candidate in character_cards:
+            candidate_local_id = candidate.get("local_id")
+
+            if candidate_local_id is None:
+                continue
+
+            try:
+                candidate_local_id = int(candidate_local_id)
+            except (TypeError, ValueError):
+                continue
+
+            if candidate_local_id not in event_local_ids:
+                continue
+
+            event_cards.append(candidate)
+
+        # Sort event cards consistently by local ID.
+        event_cards.sort(
+            key=lambda c: int(c.get("local_id", 0))
+        )
+
+        character_name = str(
+            card.get("name") or "Unknown"
+        ).strip()
+
+        character_id_text = (
+            str(character_id)
+            if character_id is not None
+            else "?"
+        )
+
+        event_lines = []
+
+        for event_card in event_cards:
+            event_local_id = event_card.get("local_id", "?")
+            event_rarity = _rarity_symbol(event_card).upper()
+
+            snapshot = session.event_cards.get(
+                str(event_local_id),
+                {},
+            )
+
+            status_emoji = snapshot.get("status_emoji")
+
+            prefix = (
+                f"{status_emoji} "
+                if status_emoji
+                else ""
+            )
+
+            event_lines.append(
+                f"-# > {prefix}[{event_rarity}] "
+                f"{event_card.get('name', character_name)}"
+            )
+
+        if event_lines:
+            event_section = (
+                f"-# **Event:** {len(event_cards)} card"
+                f"{'s' if len(event_cards) != 1 else ''}\n"
+                + "\n".join(event_lines)
+            )
+        else:
+            event_section = "-# **Event:** None"
+
+        total_count = len(character_cards)
+
+        content = (
+            f"## Series Review\n"
+            f"-# ({series_id}) {series_name}\n"
+            f"-# Remaining: {pending_count}\n"
+            f"\n"
+            f"---\n"
+            f"\n"
+            f"**{character_id_text} | {character_name}**\n"
+            f"{event_section}\n"
+            f"-# **Total:** {total_count} card"
+            f"{'s' if total_count != 1 else ''}\n"
+            f"\n"
+            f"---\n"
+            f"\n"
+            f"**{int(local_id)} | {character_name} "
+            f"({_rarity_symbol(card).upper()})**\n"
+            f"Skill: {skill_text}\n"
+            f"Luck: {luck_text}"
+        )
+
         components = [
-            {"type": 10, "content": content},
+            {
+                "type": 10,
+                "content": content,
+            },
             {
                 "type": 1,
                 "components": [
                     {
-                        "type": 2, "style": 3, "label": "Keep",
+                        "type": 2,
+                        "style": 3,
+                        "label": "Keep",
                         "custom_id": (
                             f"nebwg:auditseries:{session.user_id}:"
                             f"{series_id}:keep:{int(local_id)}"
                         ),
                     },
                     {
-                        "type": 2, "style": 4, "label": "Sell",
+                        "type": 2,
+                        "style": 4,
+                        "label": "Trash",
                         "custom_id": (
                             f"nebwg:auditseries:{session.user_id}:"
                             f"{series_id}:sell:{int(local_id)}"
@@ -561,7 +679,11 @@ class AuditMixin:
                 ],
             },
         ]
-        await self._send_channel_v2_components(channel, components)
+
+        await self._send_channel_v2_components(
+            channel,
+            components,
+        )
  
     @commands.Cog.listener("on_interaction")
     async def audit_on_interaction(self, interaction: discord.Interaction) -> None:
@@ -593,7 +715,7 @@ class AuditMixin:
             )
             return
  
-        await interaction.response.defer_update()
+        await interaction.response.defer()
  
         raw_cards = await self._audit_active_cards(user_id)
         enriched  = self._enrich_with_catalog(raw_cards)
