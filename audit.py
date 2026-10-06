@@ -1,38 +1,4 @@
-"""audit.py — Waifugami List Audit & Cleanup Engine (bot mixin layer).
- 
-Pure classification logic lives in audit_engine.py (no bot imports there).
-This file adds AuditSession, AuditMixin, all Red commands/listeners, and the
-persistent JSONL audit log.
- 
-Key fixes vs previous version
-──────────────────────────────
-1.  Pagination: Waifugami sends ONE message then EDITs it for every subsequent
-    page.  The harvest therefore listens to on_message_edit (pages 1+) as well
-    as on_message (page 0).  The on_raw_message_edit always fires alongside
-    on_message_edit but its payload carries no embeds; the guard
-    `if not after.embeds` handles it for free.
- 
-2.  Deduplication: the seen_pages set in HarvestStats rejects duplicate page
-    updates so double-firing of raw+normal edit events cannot double-count cards.
- 
-3.  parse_failures is incremented AFTER the session is located (the previous
-    code incremented it before `session` was assigned, causing AttributeError).
- 
-4.  The tuple unpack from _parse_event_list_page previously expected 4 values
-    but the function now returns a ParsedPage object — no tuple mismatch.
- 
-5.  Revalidation: before any .rm is issued, the live collection is reloaded and
-    every target local_id is verified against its audited name+rarity.  Any
-    mismatch aborts the batch.
- 
-6.  JSONL audit log: every completed audit and every destructive action is
-    appended to a per-guild JSONL file in the cog's data directory.  Logging
-    failure never blocks cleanup; it is reported but does not abort.
- 
-7.  Series review command: `..wg audit series` is now wired up.
- 
-8.  ALL classification reasons are preserved (multi-reason cards are supported).
-"""
+# audit.py
  
 from __future__ import annotations
  
@@ -56,11 +22,11 @@ from .audit_engine import (
     REASON_HIGH_STATS, REASON_HIGH_VALUE, REASON_NEAR_THRESHOLD, REASON_NO_STATS,
     RARITY_DP, OMEGA_SHARDS_PER_CARD, OMEGA_SYMBOLS,
     HIGH_VALUE_REVIEW_RARITIES, PROTECTED_SERIES_IDS,
-    SKILL_PROTECT_THRESHOLD, LUCK_PROTECT_THRESHOLD,
-    RM_BATCH_SIZE, AUDIT_SESSION_TTL,
+    SKILL_PROTECT_THRESHOLD, LUCK_PROTECT_THRESHOLD, 
+    AUDIT_SESSION_TTL,
     LIST_TITLE_RE, LIST_ENTRY_RE, FINAL_PAGE_FIELD_NAME_RE,
     WAIFUGAMI_ID, V2_FLAG,
-    classify_cards, _chunk, _is_locked, _skill, _luck,
+    classify_cards, _is_locked, _skill, _luck,
     _rarity_symbol, _dp_for_card, _shards_for_card,
     _card_identity, _series_card_identity, _series_id_for,
     parse_list_page, ParsedPage, HarvestStats,
@@ -98,7 +64,7 @@ class AuditSession:
     __slots__ = (
         "session_id",
         "user_id", "channel_id", "guild_id",
-        "phase",            # "harvesting"|"classified"|"confirming"|"executing"
+        "phase",            # "harvesting"|"classified"
         "list_message_id",  # Waifugami's .l -event all message id
         "event_cards",      # Dict[str, Dict] — local_id → snapshot
         "harvest_stats",    # HarvestStats — pagination/parse integrity
@@ -111,8 +77,6 @@ class AuditSession:
         "last_active",      # float (monotonic)
         "batch_queue",      # List[List[int]]
         "current_batch",    # Optional[List[int]]
-        "series_review_series_id",
-        "series_review_index",
         "harvested",            # bool — True only when a real harvest completed
     )
  
@@ -134,8 +98,6 @@ class AuditSession:
         self.last_active      = time.monotonic()
         self.batch_queue:     List[List[int]] = []
         self.current_batch:   Optional[List[int]] = None
-        self.series_review_series_id: Optional[int] = None
-        self.series_review_index: int = 0
         self.harvested:       bool = False
  
     def touch(self) -> None:
@@ -208,45 +170,12 @@ class AuditLog:
             "cleanup_blocked":  hs.cleanup_blocked,
         })
  
-    def record_execution_intent(
-        self,
-        *,
-        session: "AuditSession",
-        targets: List[Dict[str, Any]],
-        guild_id: int,
-    ) -> None:
-        """Written immediately before any .rm commands are sent."""
-        cards_info = [
-            {
-                "local_id":    t.get("local_id"),
-                "global_id":   t.get("global_id"),
-                "name":        t.get("name"),
-                "rarity":      t.get("rarity_symbol"),
-                "series_id":   t.get("series_id"),
-                "skill":       t.get("skill"),
-                "luck":        t.get("luck"),
-                "reasons":     t.get("reasons", []),
-                "eligibility": t.get("eligibility_reasons", []),
-            }
-            for t in targets
-        ]
-        self._append(guild_id, {
-            "event":      "removal_intended",
-            "timestamp":  time.time(),
-            "session_id": session.session_id,
-            "user_id":    session.user_id,
-            "guild_id":   guild_id,
-            "channel_id": session.channel_id,
-            "card_count": len(targets),
-            "cards":      cards_info,
-        })
- 
     def record_removal_result(
         self,
         *,
         session: "AuditSession",
         local_id: int,
-        status: str,                  # "removal_requested" | "revalidation_failed" | "removal_failed"
+        status: str,
         name: Optional[str],
         rarity: Optional[str],
         global_id: Optional[int],
@@ -254,6 +183,7 @@ class AuditLog:
         guild_id: int,
         failure_reason: Optional[str] = None,
     ) -> None:
+        """Record the result or queue state for one local card ID."""
         self._append(guild_id, {
             "event":          status,
             "timestamp":      time.time(),
@@ -264,7 +194,7 @@ class AuditLog:
             "global_id":      global_id,
             "name":           name,
             "rarity":         rarity,
-            "dp_received":    dp_received,   # null if unknown
+            "dp_received":    dp_received,
             "failure_reason": failure_reason,
         })
  
@@ -402,452 +332,6 @@ class AuditMixin:
                         pass
             enriched.append(c)
         return enriched
- 
-    # ── Persistent series review state ────────────────────────────────────
- 
-    async def _series_reviews(self, user_id: int) -> Dict[str, Any]:
-        protection = await self._audit_protection(user_id)
-        return protection.get("protected_series", {})
- 
-    async def _save_series_review(
-        self, user_id: int, series_id: str, review: Dict[str, Any]
-    ) -> None:
-        protection = await self._audit_protection(user_id)
-        protection["protected_series"][series_id] = review
-        await self._save_audit_protection(user_id, protection)
- 
-    async def _record_series_decision(
-        self,
-        user_id: int,
-        series_id: str,
-        card: Dict[str, Any],
-        decision: str,
-    ) -> None:
-        protection    = await self._audit_protection(user_id)
-        series_reviews = protection["protected_series"]
-        review = series_reviews.setdefault(str(series_id), {
-            "status": "in_progress",
-            "decisions": {},
-        })
-        review.setdefault("decisions", {})
-        review.setdefault("status", "in_progress")
- 
-        identity = _series_card_identity(card)
-        review["decisions"][identity] = {
-            "decision":    decision,
-            "name":        card.get("name", "Unknown"),
-            "rarity":      _rarity_symbol(card),
-            "last_seen_id": card.get("local_id"),
-            "decided_at":  time.time(),
-        }
-        protection["protected_series"][str(series_id)] = review
-        await self._save_audit_protection(user_id, protection)
- 
-    async def _mark_series_complete(self, user_id: int, series_id: str) -> None:
-        protection = await self._audit_protection(user_id)
-        review = protection["protected_series"].get(str(series_id), {})
-        review["status"] = "complete"
-        protection["protected_series"][str(series_id)] = review
-        await self._save_audit_protection(user_id, protection)
- 
-    # ── Series review UI ──────────────────────────────────────────────────
- 
-    async def _audit_show_series_review(self, ctx: commands.Context) -> None:
-        """Show the next protected-series card that needs a decision."""
-        session = self._audit_session(ctx.author.id)
-        if not session or not session.classified:
-            await ctx.reply(
-                "No active audit. Run `..wg audit start` or `..wg audit classify` first.",
-                mention_author=False,
-            )
-            return
- 
-        raw_cards = await self._audit_active_cards(session.user_id)
-        enriched  = self._enrich_with_catalog(raw_cards)
-        protection = await self._audit_protection(session.user_id)
-        reviews    = protection.get("protected_series", {})
- 
-        pending_by_series: Dict[int, List[Dict[str, Any]]] = {}
-        for card in enriched:
-            raw_sid = _series_id_for(card)
-            if raw_sid is None:
-                continue
-            sid_int = int(raw_sid)
-            if sid_int not in PROTECTED_SERIES_IDS:
-                continue
-            review    = reviews.get(str(sid_int), {})
-            decisions = review.get("decisions", {})
-            if _series_card_identity(card) in decisions:
-                continue
-            pending_by_series.setdefault(sid_int, []).append(card)
- 
-        if not pending_by_series:
-            session.series_review_series_id = None
-            session.series_review_index     = 0
-            await ctx.reply(
-                "All protected-series cards already have decisions.\n"
-                "Run `..wg audit classify` again, then `..wg audit sell`.",
-                mention_author=False,
-            )
-            return
- 
-        current = session.series_review_series_id
-        if current is not None and current in pending_by_series:
-            series_id = current
-        else:
-            series_id = sorted(pending_by_series)[0]
-            session.series_review_series_id = series_id
-            session.series_review_index     = 0
- 
-        cards = pending_by_series[series_id]
-        if session.series_review_index >= len(cards):
-            session.series_review_index = 0
-        card = cards[session.series_review_index]
- 
-        series_name = (
-            self._series_index.get(str(series_id))
-            or self._series_index.get(series_id)
-            or f"Series {series_id}"
-        )
-        await self._send_series_review_card(
-            ctx.channel, session, series_id, series_name, card, len(cards)
-        )
- 
-    async def _send_series_review_card(
-        self,
-        channel: discord.abc.Messageable,
-        session: AuditSession,
-        series_id: int,
-        series_name: str,
-        card: Dict[str, Any],
-        pending_count: int,
-        all_cards: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        """Send the protected-series review UI for one card."""
-
-        local_id = card.get("local_id")
-        if local_id is None:
-            return
-
-        character_id = card.get("waifu_id")
-
-        skill = card.get("skill")
-        luck = card.get("luck")
-
-        skill_text = f"{float(skill):.2f}" if skill is not None else "?"
-        luck_text = str(luck) if luck is not None else "?"
-
-        # Find other copies of this exact catalog character in this series.
-        character_cards: List[Dict[str, Any]] = []
-
-        if all_cards:
-            for candidate in all_cards:
-                candidate_sid = _series_id_for(candidate)
-
-                if candidate_sid is None or int(candidate_sid) != series_id:
-                    continue
-
-                if character_id is not None:
-                    if candidate.get("waifu_id") != character_id:
-                        continue
-                else:
-                    if _card_identity(candidate) != _card_identity(card):
-                        continue
-
-                character_cards.append(candidate)
-
-        # Event cards are identified from the harvested event-list snapshot.
-        event_cards = []
-        event_local_ids = {
-            int(local_id_key)
-            for local_id_key in session.event_cards
-            if str(local_id_key).isdigit()
-        }
-
-        for candidate in character_cards:
-            candidate_local_id = candidate.get("local_id")
-
-            if candidate_local_id is None:
-                continue
-
-            try:
-                candidate_local_id = int(candidate_local_id)
-            except (TypeError, ValueError):
-                continue
-
-            if candidate_local_id not in event_local_ids:
-                continue
-
-            event_cards.append(candidate)
-
-        # Sort event cards consistently by local ID.
-        event_cards.sort(
-            key=lambda c: int(c.get("local_id", 0))
-        )
-
-        character_name = str(
-            card.get("name") or "Unknown"
-        ).strip()
-
-        character_id_text = (
-            str(character_id)
-            if character_id is not None
-            else "?"
-        )
-
-        event_lines = []
-
-        for event_card in event_cards:
-            event_local_id = event_card.get("local_id", "?")
-            event_rarity = _rarity_symbol(event_card).upper()
-
-            snapshot = session.event_cards.get(
-                str(event_local_id),
-                {},
-            )
-
-            status_emoji = snapshot.get("status_emoji")
-
-            prefix = (
-                f"{status_emoji} "
-                if status_emoji
-                else ""
-            )
-
-            event_lines.append(
-                f"-# > {prefix}[{event_rarity}] "
-                f"{event_card.get('name', character_name)}"
-            )
-
-        if event_lines:
-            event_section = (
-                f"-# **Event:** {len(event_cards)} card"
-                f"{'s' if len(event_cards) != 1 else ''}\n"
-                + "\n".join(event_lines)
-            )
-        else:
-            event_section = "-# **Event:** None"
-
-        total_count = len(character_cards)
-
-        content = (
-            f"## Series Review\n"
-            f"-# ({series_id}) {series_name}\n"
-            f"-# Remaining: {pending_count}\n"
-            f"\n"
-            f"---\n"
-            f"\n"
-            f"**{character_id_text} | {character_name}**\n"
-            f"{event_section}\n"
-            f"-# **Total:** {total_count} card"
-            f"{'s' if total_count != 1 else ''}\n"
-            f"\n"
-            f"---\n"
-            f"\n"
-            f"**{int(local_id)} | {character_name} "
-            f"({_rarity_symbol(card).upper()})**\n"
-            f"Skill: {skill_text}\n"
-            f"Luck: {luck_text}"
-        )
-
-        components = [
-            {
-                "type": 10,
-                "content": content,
-            },
-            {
-                "type": 1,
-                "components": [
-                    {
-                        "type": 2,
-                        "style": 3,
-                        "label": "Keep",
-                        "custom_id": (
-                            f"nebwg:auditseries:{session.user_id}:"
-                            f"{series_id}:keep:{int(local_id)}"
-                        ),
-                    },
-                    {
-                        "type": 2,
-                        "style": 4,
-                        "label": "Trash",
-                        "custom_id": (
-                            f"nebwg:auditseries:{session.user_id}:"
-                            f"{series_id}:sell:{int(local_id)}"
-                        ),
-                    },
-                ],
-            },
-        ]
-
-        await self._send_channel_v2_components(
-            channel,
-            components,
-        )
- 
-    @commands.Cog.listener("on_interaction")
-    async def audit_on_interaction(self, interaction: discord.Interaction) -> None:
-        """Handle protected-series Keep/Sell buttons."""
-        data      = interaction.data or {}
-        custom_id = str(data.get("custom_id") or "")
-        match = re.fullmatch(
-            r"nebwg:auditseries:(\d+):(\d+):(keep|sell):(\d+)",
-            custom_id,
-        )
-        if not match:
-            return
- 
-        user_id   = int(match.group(1))
-        series_id = int(match.group(2))
-        decision  = match.group(3)
-        local_id  = int(match.group(4))
- 
-        if interaction.user.id != user_id:
-            await interaction.response.send_message(
-                "This audit review belongs to someone else.", ephemeral=True
-            )
-            return
- 
-        session = self._audit_session(user_id)
-        if not session or not session.classified:
-            await interaction.response.send_message(
-                "This audit session has expired. Re-run the audit.", ephemeral=True
-            )
-            return
- 
-        await interaction.response.defer()
- 
-        raw_cards = await self._audit_active_cards(user_id)
-        enriched  = self._enrich_with_catalog(raw_cards)
-        card      = next(
-            (c for c in enriched
-             if c.get("local_id") is not None and int(c["local_id"]) == local_id),
-            None,
-        )
-        if card is None:
-            await interaction.followup.send(
-                "That card is no longer present at this local ID. "
-                "Re-run the audit before continuing.",
-                ephemeral=True,
-            )
-            return
- 
-        actual_series = _series_id_for(card)
-        if actual_series is None or int(actual_series) != series_id:
-            await interaction.followup.send(
-                "That card no longer belongs to the reviewed series. Re-run the audit.",
-                ephemeral=True,
-            )
-            return
- 
-        # Safety: don't allow selling the last representative.
-        # Use session.classified as the source of truth — it reflects all
-        # protection rules (locked, event, sigma, omega, high stats, etc.),
-        # not just the series-review decisions dict.
-        if decision == "sell":
-            this_identity = _series_card_identity(card)
-            other_survivors = [
-                e for e in session.classified
-                if e.get("series_id") == str(series_id)
-                and _series_card_identity(e["card"]) != this_identity
-                and e["disposition"] != SELL
-            ]
-            if not other_survivors:
-                await interaction.followup.send(
-                    "You cannot sell this card because it is the last remaining "
-                    "representative of this protected series.",
-                    ephemeral=True,
-                )
-                return
- 
-        await self._record_series_decision(user_id, str(series_id), card, decision)
-        await self._audit_do_classify(session, interaction.channel)
- 
-        # Find remaining undecided cards.
-        raw_cards  = await self._audit_active_cards(user_id)
-        enriched   = self._enrich_with_catalog(raw_cards)
-        protection = await self._audit_protection(user_id)
-        reviews    = protection.get("protected_series", {})
- 
-        pending_by_series: Dict[int, List[Dict[str, Any]]] = {}
-        for cand in enriched:
-            sid = _series_id_for(cand)
-            if sid is None:
-                continue
-            sid_int = int(sid)
-            if sid_int not in PROTECTED_SERIES_IDS:
-                continue
-            rev = reviews.get(str(sid_int), {})
-            if _series_card_identity(cand) not in rev.get("decisions", {}):
-                pending_by_series.setdefault(sid_int, []).append(cand)
- 
-        if not pending_by_series:
-            session.series_review_series_id = None
-            session.series_review_index     = 0
-            await interaction.followup.send(
-                "Protected-series review complete.\n"
-                "Run `..wg audit sell` to review the resulting removal list.",
-                ephemeral=True,
-            )
-            return
- 
-        next_series = series_id if series_id in pending_by_series else sorted(pending_by_series)[0]
-        session.series_review_series_id = next_series
-        session.series_review_index     = 0
-        next_cards  = pending_by_series[next_series]
-        next_card   = next_cards[0]
-        series_name = (
-            self._series_index.get(str(next_series))
-            or self._series_index.get(next_series)
-            or f"Series {next_series}"
-        )
- 
-        payload = {
-            "flags": V2_FLAG,
-            "allowed_mentions": {"parse": []},
-            "components": [{"type": 17, "components": [
-                {
-                    "type": 10,
-                    "content": (
-                        f"## Protected Series Review\n"
-                        f"**Series:** `{next_series}` {series_name}\n"
-                        f"**Card:** `{next_card.get('local_id', '?')}` "
-                        f"**{next_card.get('name', 'Unknown')}** "
-                        f"`[{_rarity_symbol(next_card).upper()}]`\n"
-                        f"Skill `{next_card.get('skill', '?')}` · "
-                        f"Luck `{next_card.get('luck', '?')}`\n\n"
-                        f"-# `{len(next_cards)}` undecided card(s) remain.\n"
-                        f"-# You must keep at least one card from every protected series."
-                    ),
-                },
-                {
-                    "type": 1,
-                    "components": [
-                        {
-                            "type": 2, "style": 3, "label": "Keep",
-                            "custom_id": (
-                                f"nebwg:auditseries:{user_id}:"
-                                f"{next_series}:keep:{int(next_card['local_id'])}"
-                            ),
-                        },
-                        {
-                            "type": 2, "style": 4, "label": "Sell",
-                            "custom_id": (
-                                f"nebwg:auditseries:{user_id}:"
-                                f"{next_series}:sell:{int(next_card['local_id'])}"
-                            ),
-                        },
-                    ],
-                },
-            ]}],
-        }
-        route = Route(
-            "PATCH",
-            "/webhooks/{application_id}/{interaction_token}/messages/@original",
-            application_id=self.bot.user.id,
-            interaction_token=interaction.token,
-        )
-        await self.bot.http.request(route, json=payload)
  
     # ── Embed parsing ─────────────────────────────────────────────────────
  
@@ -1028,7 +512,11 @@ class AuditMixin:
         return (
             protection.get("event_cards", {}),
             protection.get("sigma_cards", {}),
-            protection.get("protected_series", {}),
+            # Protected-series review was removed (duplicates are handled by
+            # the `list dupes` workflow). Always classify with no stored
+            # series decisions: unreviewed protected-series cards stay REVIEW
+            # and are never offered for sale.
+            {},
         )
  
     # ── Stage 2: classify ─────────────────────────────────────────────────
@@ -1037,6 +525,7 @@ class AuditMixin:
         self,
         session: AuditSession,
         channel: Optional[discord.abc.Messageable],
+        send_report: bool = True,
     ) -> None:
         session.phase = "classified"
  
@@ -1127,17 +616,16 @@ class AuditMixin:
         if counts[REVIEW]:
             summary += (
                 f"\n\n-# `{counts[REVIEW]}` REVIEW card(s) need decisions. "
-                "Run `..wg audit series` to resolve protected-series cards, "
-                "or `..wg audit review` to inspect all REVIEW/UNKNOWN cards."
+                "Run `..wg audit review` to inspect all REVIEW/UNKNOWN cards."
             )
  
         if not (session.harvested and hs.cleanup_blocked) and counts[SELL]:
             summary += (
                 f"\n\nRun `..wg audit sell` to preview removal candidates, "
-                "then `..wg audit confirm` to execute."
+                "then `..wg audit confirm` to validate and queue them."
             )
  
-        if channel:
+        if channel and send_report:
             sections = [summary]
             try:
                 await self._send_channel_v2_components(
@@ -1215,117 +703,161 @@ class AuditMixin:
  
         session.sell_ids = [int(e["local_id"]) for e in candidates if e["local_id"] is not None]
  
-        from itertools import groupby
- 
-        sections     = []
-        header_parts = ["## SELL Candidates"]
-        if rarity_filter:
-            header_parts.append(f" · filter: `[{rarity_filter}]`")
-        if dupes_only:
-            header_parts.append(" · duplicates only")
-        header_parts.append(f"\n-# {len(candidates)} cards selected")
- 
+        # Discord's Components V2 displayable-text limit applies to the
+        # whole message, so output is split across several messages.
+        MAX_TEXT = 3000
+
         dp_total    = sum(e["dp_yield"]    for e in candidates)
         shard_total = sum(e["shard_yield"] for e in candidates)
-        header_parts.append(
-            f"  ·  estimated `{dp_total:,}` DP"
-            + (f"  ·  `{shard_total}` Omega Shards" if shard_total else "")
-        )
-        sections.append("".join(header_parts))
- 
-        DISPLAY_LIMIT = 60
-        shown = candidates[:DISPLAY_LIMIT]
-        for rarity_sym, group in groupby(shown, key=lambda e: e["rarity_symbol"]):
-            group_list  = list(group)
-            rarity_lines = [f"### [{rarity_sym.upper()}] — {len(group_list)} cards"]
-            for entry in group_list:
-                reasons_str = ", ".join(entry.get("eligibility_reasons") or entry.get("reasons") or [])
-                skill_str   = f"{entry['skill']:.2f}" if entry["skill"] is not None else "?"
-                luck_str    = str(entry["luck"]) if entry["luck"] is not None else "?"
-                rarity_lines.append(
-                    f"`{entry['local_id']}` **{entry['name']}** "
-                    f"· Skill {skill_str} · Luck {luck_str}"
-                    + (f"\n-# {reasons_str}" if reasons_str else "")
-                )
-            sections.append("\n".join(rarity_lines))
- 
-        if len(candidates) > DISPLAY_LIMIT:
-            sections.append(
-                f"-# … and {len(candidates) - DISPLAY_LIMIT} more (not shown). "
-                "All are included in removal if you confirm."
+
+        chunks: List[List[str]] = []
+        current: List[str] = []
+        current_len = 0
+
+        for entry in candidates:
+            reasons_str = ", ".join(
+                entry.get("eligibility_reasons")
+                or entry.get("reasons")
+                or []
             )
-        sections.append(
-            f"Run `..wg audit confirm` to remove these "
-            f"{len(candidates)} cards and earn `{dp_total:,}` DP."
+            skill_str = (
+                f"{entry['skill']:.2f}" if entry["skill"] is not None else "?"
+            )
+            luck_str = (
+                str(entry["luck"]) if entry["luck"] is not None else "?"
+            )
+
+            line = (
+                f"`{entry['local_id']}` **{entry['name']}** "
+                f"· `[{entry['rarity_symbol'].upper()}]` "
+                f"Skill {skill_str} · Luck {luck_str}"
+            )
+            if reasons_str:
+                line += f"\n-# {reasons_str}"
+
+            needed = len(line) + (1 if current else 0)
+
+            if current and current_len + needed > MAX_TEXT:
+                chunks.append(current)
+                current = []
+                current_len = 0
+
+            current.append(line)
+            current_len += needed
+
+        if current:
+            chunks.append(current)
+
+        total_chunks = len(chunks)
+
+        for index, chunk in enumerate(chunks, start=1):
+            page_header = "## SELL Candidates"
+
+            if rarity_filter:
+                page_header += f" · filter: `[{rarity_filter}]`"
+
+            if dupes_only:
+                page_header += " · duplicates only"
+
+            page_header += f"\n-# {len(candidates)} cards selected"
+            page_header += (
+                f"\n-# Estimated `{dp_total:,}` DP"
+                + (f" · `{shard_total}` Omega Shards" if shard_total else "")
+            )
+
+            if total_chunks > 1:
+                page_header += f"\n-# Page `{index}/{total_chunks}`"
+
+            await self._send_channel_v2_components(
+                ctx.channel,
+                self._section_components([page_header, "\n".join(chunk)]),
+            )
+
+        await ctx.send(
+            f"Run `..wg audit confirm` to validate and queue these "
+            f"{len(candidates)} cards for the separate removal workflow."
         )
- 
-        await self._send_channel_v2_components(
-            ctx.channel,
-            self._section_components(sections),
-        )
- 
+
     async def _audit_show_review(self, ctx: commands.Context) -> None:
         session = self._audit_session(ctx.author.id)
         if not session or not session.classified:
             await ctx.reply("No active audit.", mention_author=False)
             return
- 
-        entries = [e for e in session.classified if e["disposition"] in (REVIEW, UNKNOWN)]
+
+        entries = [
+            e for e in session.classified
+            if e["disposition"] in (REVIEW, UNKNOWN)
+        ]
         if not entries:
             await ctx.reply(
-                "No REVIEW or UNKNOWN cards in this audit.", mention_author=False
+                "No REVIEW or UNKNOWN cards in this audit.",
+                mention_author=False,
             )
             return
- 
-        # Discord caps a single type-10 text component at 4000 characters.
-        # Formatted lines vary in length, so we budget by character count rather
-        # than a fixed card-per-section number.
-        MAX_COMPONENT_CHARS = 3800  # safe margin below the 4000 hard limit
- 
+
         def _fmt(entry: Dict[str, Any]) -> str:
-            skill_str = f"{entry['skill']:.2f}" if entry["skill"] is not None else "?"
-            luck_str  = str(entry["luck"]) if entry["luck"] is not None else "?"
+            skill_str = (
+                f"{entry['skill']:.2f}" if entry["skill"] is not None else "?"
+            )
+            luck_str = str(entry["luck"]) if entry["luck"] is not None else "?"
+            reasons = ", ".join(entry.get("reasons") or [])
+
             return (
                 f"`{entry['local_id']}` **{entry['name']}** "
-                f"`[{entry['rarity_symbol'].upper()}]`  "
-                f"Skill {skill_str}  Luck {luck_str}  "
-                f"-# {entry['disposition']} · {', '.join(entry['reasons'])}"
+                f"`[{entry['rarity_symbol'].upper()}]` "
+                f"Skill {skill_str}  "
+                f"Luck {luck_str}  "
+                f"-# {entry['disposition']}"
+                + (f" · {reasons}" if reasons else "")
             )
- 
-        header = (
-            f"## Review & Unknown Cards\n"
-            f"-# {len(entries)} cards require manual inspection"
-        )
-        sections = [header]
- 
-        current_lines: List[str] = []
+
+        # Discord's Components V2 displayable-text limit applies to the
+        # entire message, not each type-10 component. Stay well below 4000
+        # so headers and formatting cannot push us over.
+        MAX_TEXT = 3000
+
+        chunks: List[List[str]] = []
+        current: List[str] = []
         current_len = 0
+
         for entry in entries:
             line = _fmt(entry)
-            # +1 for the joining newline
-            needed = len(line) + (1 if current_lines else 0)
-            if current_lines and current_len + needed > MAX_COMPONENT_CHARS:
-                sections.append("\n".join(current_lines))
-                current_lines = []
+            needed = len(line) + (1 if current else 0)
+
+            if current and current_len + needed > MAX_TEXT:
+                chunks.append(current)
+                current = []
                 current_len = 0
-            current_lines.append(line)
+
+            current.append(line)
             current_len += needed
-        if current_lines:
-            sections.append("\n".join(current_lines))
- 
-        await self._send_channel_v2_components(
-            ctx.channel,
-            self._section_components(sections),
-        )
- 
-    # ── Stage 3: confirm & execute ────────────────────────────────────────
+
+        if current:
+            chunks.append(current)
+
+        total_chunks = len(chunks)
+
+        for index, chunk in enumerate(chunks, start=1):
+            header = (
+                "## Review & Unknown Cards\n"
+                f"-# {len(entries)} cards require manual inspection"
+            )
+            if total_chunks > 1:
+                header += f"\n-# Page `{index}/{total_chunks}`"
+
+            await self._send_channel_v2_components(
+                ctx.channel,
+                self._section_components([header, "\n".join(chunk)]),
+            )
+
+    # ── Stage 3: confirm & queue ─────────────────────────────────────────
  
     async def _audit_confirm(
         self,
         ctx:          commands.Context,
         override_ids: Optional[List[int]] = None,
     ) -> None:
-        """Validate, revalidate, and execute .rm removal batches."""
+        """Validate and record safe removal IDs for the separate removal workflow."""
         session = self._audit_session(ctx.author.id)
         if not session or not session.classified:
             await ctx.reply(
@@ -1348,7 +880,7 @@ class AuditMixin:
         # Only applies when a harvest was actually attempted this session.
         hs = session.harvest_stats
         if session.harvested and hs.cleanup_blocked:
-            parts = ["⛔ **Cannot execute removal — cleanup is blocked.**"]
+            parts = ["⛔ **Cannot record removal IDs because cleanup is blocked.**"]
             missing = hs.pages_missing
             if missing:
                 parts.append(
@@ -1420,11 +952,21 @@ class AuditMixin:
                 )
                 continue
  
-            # Compare identity.  When both sides carry a global_id, use it as
-            # the primary key — it is stable across local-list reindexing.
-            # Fall back to name+rarity only when one side lacks a global_id.
+            # Compare identity. When both sides carry a global_id, use it as
+            # the primary key because it is stable across local-list
+            # reindexing. Fall back to the card identity when either side
+            # lacks a global_id.
+
+            audited_ident = (
+                _card_identity(audited["card"])
+                if audited
+                else None
+            )
+            live_ident = _card_identity(live)
+
             audited_gid: Optional[int] = None
-            live_gid:    Optional[int] = None
+            live_gid: Optional[int] = None
+
             if audited:
                 try:
                     _raw_gid = audited["card"].get("global_id")
@@ -1432,37 +974,47 @@ class AuditMixin:
                         audited_gid = int(_raw_gid)
                 except (TypeError, ValueError):
                     pass
+
             try:
                 _raw_gid = live.get("global_id")
                 if _raw_gid is not None:
                     live_gid = int(_raw_gid)
             except (TypeError, ValueError):
                 pass
- 
+
             if audited_gid is not None and live_gid is not None:
-                match = (audited_gid == live_gid)
+                match = audited_gid == live_gid
             else:
-                audited_ident = _card_identity(audited["card"]) if audited else None
-                live_ident    = _card_identity(live)
-                match = (audited_ident is not None and audited_ident == live_ident)
- 
+                match = (
+                    audited_ident is not None
+                    and audited_ident == live_ident
+                )
+
             if not match:
                 revalidation_failures.append((
                     lid,
-                    f"identity mismatch: audited={audited_ident!r} live={live_ident!r}",
+                    (
+                        f"identity mismatch: "
+                        f"audited={audited_ident!r} "
+                        f"live={live_ident!r}"
+                    ),
                     audited["name"] if audited else "Unknown",
                 ))
                 self._audit_log.record_revalidation_failure(
-                    session        = session,
-                    local_id       = lid,
-                    audited_name   = audited["name"] if audited else None,
-                    audited_rarity = audited["rarity_symbol"] if audited else None,
-                    live_name      = live.get("name"),
-                    live_rarity    = _rarity_symbol(live),
-                    guild_id       = session.guild_id,
+                    session=session,
+                    local_id=lid,
+                    audited_name=audited["name"] if audited else None,
+                    audited_rarity=(
+                        audited["rarity_symbol"]
+                        if audited
+                        else None
+                    ),
+                    live_name=live.get("name"),
+                    live_rarity=_rarity_symbol(live),
+                    guild_id=session.guild_id,
                 )
                 continue
- 
+
             clean_ids.append(lid)
  
         if revalidation_failures:
@@ -1510,93 +1062,87 @@ class AuditMixin:
             )
             return
  
-        # Build target info for the audit log.
-        targets = [classified_by_lid[lid] for lid in clean_ids if lid in classified_by_lid]
-        self._audit_log.record_execution_intent(
-            session  = session,
-            targets  = targets,
-            guild_id = session.guild_id,
+        # Record the validated local IDs for the separate removal workflow.
+        #
+        # The audit engine deliberately does NOT send `.rm`.
+        # The separate removal workflow will consume these IDs in batches.
+        clean_sell_ids = sorted(set(clean_ids))
+
+        session.sell_ids = clean_sell_ids
+
+        await self._audit_record_selected_ids(
+            session,
+            ctx.channel,
+            clean_sell_ids,
+            classified_by_lid,
         )
  
-        all_ids_sorted_desc = sorted(set(clean_ids), reverse=True)
-        batches = list(_chunk(all_ids_sorted_desc, RM_BATCH_SIZE))
- 
-        session.phase       = "executing"
-        session.batch_queue = batches
-        session.current_batch = None
- 
-        total    = len(clean_ids)
-        n_batches = len(batches)
-        await ctx.reply(
-            f"**Removing {total} card(s) across {n_batches} batch(es) of ≤ {RM_BATCH_SIZE}.**\n"
-            "-# Issuing `.rm` commands — do not touch your list until complete.",
-            mention_author=False,
-        )
-        await self._audit_execute_next_batch(session, ctx.channel, classified_by_lid)
- 
-    async def _audit_execute_next_batch(
+    async def _audit_record_selected_ids(
         self,
-        session:        AuditSession,
-        channel:        discord.abc.Messageable,
+        session: AuditSession,
+        channel: discord.abc.Messageable,
+        local_ids: List[int],
         classified_by_lid: Dict[int, Dict[str, Any]],
     ) -> None:
-        if not session.batch_queue:
+
+        clean_ids = sorted(
+            {
+                int(local_id)
+                for local_id in local_ids
+                if int(local_id) in classified_by_lid
+            }
+        )
+
+        if not clean_ids:
             await channel.send(
-                "✅ **Audit removal complete.** All selected cards have been removed."
+                "No validated local IDs remain to record."
             )
-            self._audit_cancel(session.user_id)
             return
- 
-        batch = session.batch_queue.pop(0)
-        session.current_batch = batch
-        session.touch()
- 
-        for local_id in batch:
+
+        protection = await self._audit_protection(session.user_id)
+
+        pending_tag_ids = protection.setdefault("pending_tag_ids", [])
+
+        existing = {
+            int(value)
+            for value in pending_tag_ids
+            if str(value).isdigit()
+        }
+
+        existing.update(clean_ids)
+
+        protection["pending_tag_ids"] = sorted(existing)
+
+        await self._save_audit_protection(
+            session.user_id,
+            protection,
+        )
+
+        for local_id in clean_ids:
             entry = classified_by_lid.get(local_id)
-            try:
-                await channel.send(f".rm {local_id}")
-                self._audit_log.record_removal_result(
-                    session     = session,
-                    local_id    = local_id,
-                    status      = "removal_requested",
-                    name        = entry["name"] if entry else None,
-                    rarity      = entry["rarity_symbol"] if entry else None,
-                    global_id   = entry["global_id"] if entry else None,
-                    dp_received = None,   # actual reward comes from Waifugami response
-                    guild_id    = session.guild_id,
-                )
-                await asyncio.sleep(1.2)
-            except discord.HTTPException as exc:
-                self._audit_log.record_removal_result(
-                    session        = session,
-                    local_id       = local_id,
-                    status         = "removal_failed",
-                    name           = entry["name"] if entry else None,
-                    rarity         = entry["rarity_symbol"] if entry else None,
-                    global_id      = entry["global_id"] if entry else None,
-                    dp_received    = None,
-                    guild_id       = session.guild_id,
-                    failure_reason = str(exc),
-                )
-                await channel.send(
-                    f"⚠️ Failed to send `.rm {local_id}`: {exc}. "
-                    "Stopping. Re-run `..wg audit confirm` to retry remaining."
-                )
-                session.phase = "classified"
-                return
- 
-        remaining = len(session.batch_queue)
-        if remaining:
-            await channel.send(
-                f"-# Batch done. {remaining} batch(es) remaining. Continuing in 3 s…"
+
+            self._audit_log.record_removal_result(
+                session=session,
+                local_id=local_id,
+                status="queued_for_removal",
+                name=entry["name"] if entry else None,
+                rarity=entry["rarity_symbol"] if entry else None,
+                global_id=entry["global_id"] if entry else None,
+                dp_received=None,
+                guild_id=session.guild_id,
             )
-            await asyncio.sleep(3)
-            await self._audit_execute_next_batch(session, channel, classified_by_lid)
-        else:
-            await channel.send(
-                "✅ **Audit removal complete.** All selected cards have been removed."
-            )
-            self._audit_cancel(session.user_id)
+
+        session.batch_queue.clear()
+        session.current_batch = None
+        session.phase = "classified"
+        session.touch()
+
+        await channel.send(
+            f"✅ **Audit selection recorded.**\n"
+            f"{len(clean_ids)} local ID(s) queued for the separate "
+            f"removal workflow.\n\n"
+            f"-# No `.rm` commands were sent."
+        )
  
     # ── Listener hooks ─────────────────────────────────────────────────────
     #
@@ -1610,19 +1156,20 @@ class AuditMixin:
     # it exits immediately — no duplicate processing.
  
     async def audit_on_new_message(self, message: discord.Message) -> bool:
-        """Capture the FIRST page of `.l -event all` (arrives as a new message).
- 
-        Returns True if the message was consumed by an active audit harvest.
+        """Capture Waifugami list page 0 (arrives as a new message).
+
+        Returns True if the message was consumed by an active harvest.
         """
         if message.author.id != WAIFUGAMI_ID:
             return False
         if not message.embeds:
             return False
- 
+
         page = self._parse_event_list_embed(message.embeds[0], message.id)
         if page.owner_name is None:
             return False
- 
+
+        # Normal `.l -event all` harvest.
         for session in list(self._audit_sessions.values()):
             if (
                 session.channel_id == message.channel.id
@@ -1631,36 +1178,40 @@ class AuditMixin:
             ):
                 await self._audit_collect_page(message)
                 return True
- 
+
         return False
- 
+
     async def audit_on_message_edit(
         self, before: discord.Message, after: discord.Message
     ) -> bool:
-        """Capture pages 1..N of `.l -event all` (arrive as message edits).
- 
-        Returns True if the edit was consumed by an active audit harvest.
+        """Capture pages 1..N of a Waifugami list (arrive as message edits).
+
+        Returns True if the edit was consumed by an active audit.
         """
         if after.author.id != WAIFUGAMI_ID:
             return False
         if not after.embeds:
             return False
- 
+
         page = self._parse_event_list_embed(after.embeds[0], after.id)
         if page.owner_name is None:
             return False
- 
+
+        # Normal event harvest.
         for session in list(self._audit_sessions.values()):
             if (
                 session.channel_id == after.channel.id
                 and session.phase == "harvesting"
-                and (session.list_message_id is None or session.list_message_id == after.id)
+                and (
+                    session.list_message_id is None
+                    or session.list_message_id == after.id
+                )
             ):
                 await self._audit_collect_page(after)
                 return True
- 
+
         return False
- 
+
     # ── Commands ──────────────────────────────────────────────────────────
  
     @commands.group(name="wgaudit", aliases=["wga"])
@@ -1668,17 +1219,16 @@ class AuditMixin:
         """List Audit & Cleanup Engine — identify and remove low-value cards.
  
         Workflow:
-          1. ``..wg audit start``       — begin harvesting event cards
+          1. ``..wg audit start``       - begin harvesting event cards
           2. Run `.l -event all` in the same channel and flip through ALL pages
-          3. ``..wg audit sell``        — browse SELL candidates
-          4. ``..wg audit confirm``     — execute `.rm` removals in safe batches
- 
+          3. ``..wg audit sell``        - browse SELL candidates
+          4. ``..wg audit confirm``     - validate and queue approved local IDs
+
         Optional filters for step 3:
-          ``..wg audit sell <rarity>``  — e.g. ``sell α``
-          ``..wg audit sell dupes``     — duplicates only
-          ``..wg audit review``         — inspect REVIEW / UNKNOWN cards
-          ``..wg audit series``         — resolve protected-series decisions
- 
+          ``..wg audit sell <rarity>``  - e.g. ``sell α``
+          ``..wg audit sell dupes``     - duplicates only
+          ``..wg audit review``         - inspect REVIEW / UNKNOWN cards
+
         To skip event harvesting:
           ``..wg audit classify``
         """
@@ -1755,21 +1305,20 @@ class AuditMixin:
         """Show cards in the REVIEW or UNKNOWN category."""
         await self._audit_show_review(ctx)
  
-    @wgaudit.command(name="series")
-    async def wgaudit_series_review(self, ctx: commands.Context) -> None:
-        """Walk through protected-series cards that need keep/sell decisions."""
-        await self._audit_show_series_review(ctx)
- 
     @wgaudit.command(name="confirm")
     async def wgaudit_confirm(
         self, ctx: commands.Context, *, ids_str: str = ""
     ) -> None:
-        """Execute removal of the current SELL selection (or explicit IDs).
- 
-        Without arguments, removes all cards selected by ``..wg audit sell``.
-        With arguments, removes only the specified local IDs::
- 
+        """Validate the current SELL selection and queue its local IDs.
+
+        Without arguments, validates all cards selected by
+        ``..wg audit sell``.
+
+        With arguments, validates only the specified local IDs::
+
             ..wg audit confirm 142 201 309
+
+        No `.rm` commands are sent by the audit engine.
         """
         override: Optional[List[int]] = None
         if ids_str.strip():
