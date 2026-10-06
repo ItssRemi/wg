@@ -78,7 +78,7 @@ SKILL_NEAR_THRESHOLD_FACTOR = 0.85   # Skill > 90 * 0.85 == > 76.5
 LUCK_NEAR_THRESHOLD = LUCK_PROTECT_THRESHOLD   # Luck >= 5
 
 # Maximum cards per .rm batch (index-shift safety).
-RM_BATCH_SIZE = 30
+RM_BATCH_SIZE = 20
 
 # Audit session TTL in seconds (30 minutes of inactivity).
 AUDIT_SESSION_TTL = 60 * 30
@@ -198,18 +198,22 @@ def _card_identity(card: Dict[str, Any]) -> str:
 
 
 def _series_card_identity(card: Dict[str, Any]) -> str:
-    """Stable identity for one physical card during protected-series review.
-
-    Global IDs identify individual cards across local-list reindexing.
-    Fall back to name+rarity when no global ID is stored.
-    """
+    """Stable physical-card identity for protected-series review."""
     global_id = card.get("global_id")
     if global_id is not None:
         try:
             return f"global:{int(global_id)}"
         except (TypeError, ValueError):
             pass
-    return _card_identity(card)
+
+    local_id = card.get("local_id")
+    if local_id is not None:
+        try:
+            return f"local:{int(local_id)}"
+        except (TypeError, ValueError):
+            pass
+
+    return f"card:{_card_identity(card)}"
 
 
 def _event_identity_set(
