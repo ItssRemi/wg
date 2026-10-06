@@ -27,6 +27,7 @@ from redbot.core.data_manager import cog_data_path
 log = logging.getLogger("red.nebula.Waifugami")
 
 from .audit import AuditMixin  # noqa: E402  (after constants are defined above)
+from .dupes import DupesMixin  # noqa: E402
 
 # ============================================================
 # Constants — card tracking (from WaifugamiCards)
@@ -309,7 +310,7 @@ class WGTrackedView(discord.ui.View):
         await self._edit(interaction)
 
 
-class Waifugami(AuditMixin, commands.Cog):
+class Waifugami(AuditMixin, DupesMixin, commands.Cog):
     """Waifugami card tracking, team building, and spawn assistant.
 
     Run ``[p]help wg`` to see every Waifugami command in one place.
@@ -465,6 +466,8 @@ class Waifugami(AuditMixin, commands.Cog):
 
         # ---- audit engine (AuditMixin) ----
         self._audit_init()
+        # ---- duplicate review (DupesMixin) ----
+        self._dupes_init()
 
     async def cog_load(self) -> None:
         # card tracking
@@ -1516,6 +1519,9 @@ class Waifugami(AuditMixin, commands.Cog):
             return
 
         if not message.author.bot:
+            # `list dupes` (reply to a list) and `keep <ids>`.
+            if await self._dupes_on_user_message(message):
+                return
             list_trigger = (message.content or "").strip().casefold()
             if list_trigger in {"list", "list v", "list new"}:
                 if await self._try_list_action_from_reply(message, list_trigger):
@@ -1578,6 +1584,7 @@ class Waifugami(AuditMixin, commands.Cog):
 
         if observed_cards:
             await self._confirm_scan_batch(message, observed_cards)
+            await self._dupes_on_cards(message, observed_cards)
 
         acquisition = self._parse_acquisition(message.content or "")
         if acquisition:
@@ -1711,6 +1718,9 @@ class Waifugami(AuditMixin, commands.Cog):
     async def on_message_edit_cards(self, before: discord.Message, after: discord.Message) -> None:
         if after.author.id != WAIFUGAMI_ID:
             return
+
+        # ---- duplicate review: read list pages as they are flipped ----
+        await self._dupes_on_list_edit(after)
 
         # ---- audit engine: consume .l -event all pages ----
         if await self.audit_on_message_edit(before, after):
