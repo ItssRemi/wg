@@ -1,0 +1,17 @@
+{
+  "author": [
+    "Nebula"
+  ],
+  "description": "Globally tracks Dank Memer adventure runs, rewards, losses, values, currencies, multipliers, Compass effects, per-interaction luck observations, a five-page Components V2 stats menu, and a network-wide leaderboard.",
+  "install_msg": "Load with `[p]load adventuretracker`. Collection is enabled for all channels by default. Use `[p]adventure trackerstatus` to verify it is recording.",
+  "short": "Accurate Dank Memer adventure statistics and leaderboard.",
+  "requirements": [],
+  "tags": [
+    "dank memer",
+    "adventure",
+    "statistics",
+    "leaderboard"
+  ],
+  "min_bot_version": "3.5.0",
+  "end_user_data_statement": "Stores Discord user IDs, adventure backpack selections, interaction outcomes, item luck contributions, and game activity needed to calculate adventure statistics."
+}

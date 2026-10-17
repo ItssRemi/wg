@@ -1,0 +1,408 @@
+[
+    {
+        "description": "You see some bandits about to rob the local towns bank. What do you do?",
+        "button_label": "Join them",
+        "custom_id": "adventure-option:17:0",
+        "outcome": "⏣ 100,000",
+        "outcome_2": null
+    },
+    {
+        "description": "You see some bandits about to rob the local towns bank. What do you do?",
+        "button_label": "Stop Them",
+        "custom_id": "adventure-option:17:1",
+        "outcome": "⏣ 70,000\n1 <:GoldenNugget:1369070557324378182> Golden Nugget",
+        "outcome_2": null
+    },
+    {
+        "description": "You see some bandits about to rob the local towns bank. What do you do?",
+        "button_label": "Report Them",
+        "custom_id": "adventure-option:17:2",
+        "outcome": "⏣ 35,000\n<:Lasso:1369070612152057997> Lasso",
+        "outcome_2": null
+    },
+    {
+        "description": "You see some bandits about to rob the local towns bank. What do you do?",
+        "button_label": "Run away",
+        "custom_id": "adventure-option:17:3",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "A lady next to a broken down wagon is yelling for help.",
+        "button_label": "Help her",
+        "custom_id": "adventure-option:22:0",
+        "outcome": "⏣ 50,000\n1 <:SpurBoots:1369060348174536815> Cowboy Boots",
+        "outcome_2": null
+    },
+     {
+        "description": "A lady next to a broken down wagon is yelling for help.",
+        "button_label": "Ignore her",
+        "custom_id": "adventure-option:22:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "You entered the saloon to rest from the journey. What do you want to do?",
+        "button_label": "Take a drink",
+        "custom_id": "adventure-option:18:0",
+        "outcome": "⏣ 25,000",
+        "outcome_2": null
+    },
+    {
+        "description": "You entered the saloon to rest from the journey. What do you want to do?",
+        "button_label": "Throw a drink",
+        "custom_id": "adventure-option:18:1",
+        "outcome": "⏣ 75,000",
+        "outcome_2": null
+    },
+    {
+        "description": "You entered the saloon to rest from the journey. What do you want to do?",
+        "button_label": "Play the piano",
+        "custom_id": "adventure-option:18:2",
+        "outcome": "⏣ 35,000",
+        "outcome_2": null
+    },
+    {
+        "description": "You entered the saloon to rest from the journey. What do you want to do?",
+        "button_label": "Gamble",
+        "custom_id": "adventure-option:18:3",
+        "outcome": "⏣ 35,000",
+        "outcome_2": null
+    },
+    {
+        "description": "You're dying of thirst. Where do you want to get water?",
+        "button_label": "Old Creek",
+        "custom_id": "adventure-option:27:0",
+        "outcome": "⏣ 20,000\n1 <:CowBoyHat:1369060354314997862> Cowboy Hat",
+        "outcome_2": null
+    },
+    {
+        "description": "You're dying of thirst. Where do you want to get water?",
+        "button_label": "Cactus",
+        "custom_id": "adventure-option:27:1",
+        "outcome": "⏣ 25,000\n<:Cactus:1369055487978639371> Cactus",
+        "outcome_2": null
+    },
+    {
+        "description": "You're dying of thirst. Where do you want to get water?",
+        "button_label": "Water Fountain",
+        "custom_id": "adventure-option:27:2",
+        "outcome": "⏣ 25,000",
+        "outcome_2": null
+    },
+    {
+        "description": "You found a stray horse. What do you want to do?",
+        "button_label": "Tame",
+        "custom_id": "adventure-option:26:0",
+        "outcome": "1 <:HorseSaddle:1369075725214421112> Pet Saddle",
+        "outcome_2": null
+    },
+    {
+        "description": "You found a stray horse. What do you want to do?",
+        "button_label": "Ignore",
+        "custom_id": "adventure-option:26:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "You found a stray horse. What do you want to do?",
+        "button_label": "Feed",
+        "custom_id": "adventure-option:26:2",
+        "outcome": "⏣ 25,000\n1 <:Cactus:1369055487978639371> Cactus",
+        "outcome_2": null
+    },
+    {
+        "description": "You stumble upon someone in the road claiming to have been bitten by a rattlesnake. They say they need your help.",
+        "button_label": "Walk away",
+        "custom_id": "adventure-option:36:0",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "You stumble upon someone in the road claiming to have been bitten by a rattlesnake. They say they need your help.",
+        "button_label": "Suck it",
+        "custom_id": "adventure-option:36:1",
+        "outcome": "1 <:Alcohol:1369055414066614383> Alcohol",
+        "outcome_2": null
+    },
+    {
+        "description": "You stumble upon someone in the road claiming to have been bitten by a rattlesnake. They say they need your help.",
+        "button_label": "Give them medicine",
+        "custom_id": "adventure-option:36:2",
+        "outcome": "+5% Luck Multiplier for 15m",
+        "outcome_2": null
+    },
+    {
+        "description": "You stumble upon someone in the road claiming to have been bitten by a rattlesnake. They say they need your help.",
+        "button_label": "Rob them",
+        "custom_id": "adventure-option:36:3",
+        "outcome": "⏣ 100,000\n<a:SnakePet:1385646798239961320> Snake Pet",
+        "outcome_2": null
+    },
+    {
+        "description": "You encounter someone with a dope ass cowboy hat who seems to enjoy radio equipment and lockpicking.",
+        "button_label": "Huff a muffin",
+        "custom_id": "adventure-option:34:0",
+        "outcome": "1 <:WeetsDonut:1369085665349996576> Weet's Donut\n<:title:1385645524581089280> Title",
+        "outcome_2": null
+    },
+    {
+        "description": "You encounter someone with a dope ass cowboy hat who seems to enjoy radio equipment and lockpicking.",
+        "button_label": "Compare ass sizes",
+        "custom_id": "adventure-option:34:1",
+        "outcome": "1 <:WeetsDonut:1369085665349996576> Weet's Donut",
+        "outcome_2": null
+    },
+    {
+        "description": "You encounter someone with a dope ass cowboy hat who seems to enjoy radio equipment and lockpicking.",
+        "button_label": "Pick a lock together",
+        "custom_id": "adventure-option:34:2",
+        "outcome": "<:padlock:1369075443767972021>Padlock\n1 <a:OldCowboyRevolver:1369075695032078436> Old Cowboy Revolver",
+        "outcome_2": null
+    },
+    {
+        "description": "You go to a saloon where there's a sick looking mechanical bull ready for riding.",
+        "button_label": "Ride it",
+        "custom_id": "adventure-option:35:0",
+        "outcome": "1 <:Alcohol:1369055414066614383> Alcohol",
+        "outcome_2": null
+    },
+    {
+        "description": "You go to a saloon where there's a sick looking mechanical bull ready for riding.",
+        "button_label": "Kill it",
+        "custom_id": "adventure-option:35:1",
+        "outcome": "1 <:HorseSaddle:1369075725214421112> Pet Saddle\n1 <:LowRifle:1362586754049376256> Hunting Rifle",
+        "outcome_2": null
+    },
+    {
+        "description": "You come across a saloon with a poker game going on inside. What do you want to do?",
+        "button_label": "Join",
+        "custom_id": "adventure-option:31:0",
+        "outcome": "1 <:StackOfCash:1369060228649451722> Stack of Cash",
+        "outcome_2": null
+    },
+    {
+        "description": "You come across a saloon with a poker game going on inside. What do you want to do?",
+        "button_label": "Ignore",
+        "custom_id": "adventure-option:31:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "You find a dank cellar with an old wooden box",
+        "button_label": "Grab it",
+        "custom_id": "adventure-option:29:0",
+        "outcome": "1 <a:WoodBoxClosed:1369075419713900554> Old Box",
+        "outcome_2": null
+    },
+    {
+        "description": "You find a dank cellar with an old wooden box",
+        "button_label": "Ignore it",
+        "custom_id": "adventure-option:29:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "A stranger challenges you to a quick draw. What do you want to do?",
+        "button_label": "Accept",
+        "custom_id": "adventure-option:33:0",
+        "outcome": "5 <:SkinFragments:1375220870586564649> Skin Fragments\n<:ammo2:1386136575452381304> Skin for Ammo Item",
+        "outcome_2": null
+    },
+    {
+        "description": "A stranger challenges you to a quick draw. What do you want to do?",
+        "button_label": "Decline",
+        "custom_id": "adventure-option:33:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "Someone is getting ambushed by bandits!",
+        "button_label": "Save them",
+        "custom_id": "adventure-option:25:0",
+        "outcome": "⏣ 75,000\n1 <:HorseSaddle:1369075725214421112> Pet Saddle",
+        "outcome_2": null
+    },
+    {
+        "description": "Someone is getting ambushed by bandits!",
+        "button_label": "Ignore them",
+        "custom_id": "adventure-option:25:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "Catch one of em! <:Lasso:950807315915870279>",
+        "button_label": "🐄",
+        "custom_id": "adventure-option:24:0",
+        "outcome": "1 <:Lasso:1369070612152057997> Lasso",
+        "outcome_2": null
+    },
+    {
+        "description": "Catch one of em! <:Lasso:950807315915870279>",
+        "button_label": "🐄",
+        "custom_id": "adventure-option:24:1",
+        "outcome": "⏣ 10,000\n1 <a:OldCowboyRevolver:1369075695032078436> Old Cowboy Revolver",
+        "outcome_2": null
+    },
+    {
+        "description": "Catch one of em! <:Lasso:950807315915870279>",
+        "button_label": "🐄",
+        "custom_id": "adventure-option:24:2",
+        "outcome": "1 <:GoldenNugget:1369070557324378182> Golden Nugget",
+        "outcome_2": null
+    },
+    {
+        "description": "You find an abandoned mine. What do you want to do?",
+        "button_label": "Explore",
+        "custom_id": "adventure-option:30:0",
+        "outcome": "⏣ 100,000\n1 <:GoldenNugget:1369070557324378182> Golden Nugget",
+        "outcome_2": null
+    },
+    {
+        "description": "You find an abandoned mine. What do you want to do?",
+        "button_label": "Ignore",
+        "custom_id": "adventure-option:30:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "A snake is blocking your path. What do you want to do?",
+        "button_label": "Chase",
+        "custom_id": "adventure-option:32:0",
+        "outcome": "<a:SnakePet:1385646798239961320> Snake Pet",
+        "outcome_2": null
+    },
+    {
+        "description": "A snake is blocking your path. What do you want to do?",
+        "button_label": "Wait",
+        "custom_id": "adventure-option:32:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "You bump into someone near the horse stables. They challenge you to a duel <a:OldCowboyRevolver:946724166223138856>! What do you do?",
+        "button_label": "Lets duel!",
+        "custom_id": "adventure-option:15:0",
+        "outcome": "⏣ 20,000\n1 <a:OldCowboyRevolver:1369075695032078436> Old Cowboy Revolver",
+        "outcome_2": null
+    },
+    {
+        "description": "You bump into someone near the horse stables. They challenge you to a duel <a:OldCowboyRevolver:946724166223138856>! What do you do?",
+        "button_label": "Run away",
+        "custom_id": "adventure-option:15:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "You wander towards an old abandoned mine.",
+        "button_label": "Go in",
+        "custom_id": "adventure-option:19:0",
+        "outcome": "1 <:GoldenNugget:1369070557324378182> Golden Nugget",
+        "outcome_2": null
+    },
+    {
+        "description": "You wander towards an old abandoned mine.",
+        "button_label": "Walk away",
+        "custom_id": "adventure-option:19:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "You get on a train and some bandits decide to rob the train. What do you do?",
+        "button_label": "Don't hurt me!",
+        "custom_id": "adventure-option:21:0",
+        "outcome": "⏣ 100,000\n1 <:CowBoyHat:1369060354314997862> Cowboy Hat",
+        "outcome_2": null
+    },
+    {
+        "description": "You get on a train and some bandits decide to rob the train. What do you do?",
+        "button_label": "Fight back",
+        "custom_id": "adventure-option:21:1",
+        "outcome": "⏣ 150,000\n1 <:TreasureMap:1369085642973384725> Treasure Map",
+        "outcome_2": null
+    },
+    {
+        "description": "Someone on the trail is lost and asks you for directions.",
+        "button_label": "Help Them",
+        "custom_id": "adventure-option:28:0",
+        "outcome": "⏣ 25,000\n<:title:1385645524581089280> 'Kind Soul' Title",
+        "outcome_2": null
+    },
+    {
+        "description": "Someone on the trail is lost and asks you for directions.",
+        "button_label": "Ignore Them",
+        "custom_id": "adventure-option:28:1",
+        "outcome": "1 <a:TumbleWeed:1369085648257941626> Tumbleweed",
+        "outcome_2": null
+    },
+    {
+        "description": "Your horse sees a snake and throws you off. What do you do?",
+        "button_label": "Find a new horse",
+        "custom_id": "adventure-option:20:0",
+        "outcome": "1 <:Lasso:1369070612152057997> Lasso",
+        "outcome_2": null
+    },
+    {
+        "description": "Your horse sees a snake and throws you off. What do you do?",
+        "button_label": "Kill the snake",
+        "custom_id": "adventure-option:20:1",
+        "outcome": "⏣ 60,000\n1 <a:TumbleWeed:1369085648257941626> Tumbleweed",
+        "outcome_2": null
+    },
+    {
+        "description": "Your horse sees a snake and throws you off. What do you do?",
+        "button_label": "Report to the sheriff",
+        "custom_id": "adventure-option:20:2",
+        "outcome": "⏣ 50,000",
+        "outcome_2": null
+    },
+    {
+        "description": "__**WANTED:**__\nBilly Bob Jr. - ⏣ 70,000\nJesse James -  ⏣ 55,000\nDavy Jones -  ⏣ 90,000\nWho will you take down?",
+        "button_label": "Billy Bob Jr.",
+        "custom_id": "adventure-option:16:0",
+        "outcome": "⏣ 70,000\n1 <:GoldenNugget:1369070557324378182> Golden Nugget",
+        "outcome_2": null
+    },
+    {
+        "description": "__**WANTED:**__\nBilly Bob Jr. - ⏣ 70,000\nJesse James -  ⏣ 55,000\nDavy Jones -  ⏣ 90,000\nWho will you take down?",
+        "button_label": "Jesse James",
+        "custom_id": "adventure-option:16:1",
+        "outcome": "⏣ 55,000\n1 <a:OldCowboyRevolver:1369075695032078436> Old Cowboy Revolver",
+        "outcome_2": null
+    },
+    {
+        "description": "__**WANTED:**__\nBilly Bob Jr. - ⏣ 70,000\nJesse James -  ⏣ 55,000\nDavy Jones -  ⏣ 90,000\nWho will you take down?",
+        "button_label": "Davy Jones",
+        "custom_id": "adventure-option:16:2",
+        "outcome": "⏣ 90,000\n1 <:TreasureMap:1369085642973384725> Treasure Map",
+        "outcome_2": null
+    },
+    {
+        "description": "You're riding on your horse and you get ambushed. What do you do?",
+        "button_label": "Fight Back",
+        "custom_id": "adventure-option:23:0",
+        "outcome": "⏣ 100,000",
+        "outcome_2": null
+    },
+    {
+        "description": "You're riding on your horse and you get ambushed. What do you do?",
+        "button_label": "Run away",
+        "custom_id": "adventure-option:23:1",
+        "outcome": null,
+        "outcome_2": "<:nothing:1409968316235255839><:loseall:1379142669741068461>"
+    },
+    {
+        "description": "You find an abandoned mine. What do you want to do?",
+        "button_label": "Explore",
+        "custom_id": "adventure-option:30:0",
+        "outcome": "⏣ 100,000\n1 <:GoldenNugget:1369070557324378182> Golden Nugget",
+        "outcome_2": null
+    },
+    {
+        "description": "You find an abandoned mine. What do you want to do?",
+        "button_label": "Ignore",
+        "custom_id": "adventure-option:30:1",
+        "outcome": null,
+        "outcome_2": null
+    }
+]

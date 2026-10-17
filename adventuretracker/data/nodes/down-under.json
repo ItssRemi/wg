@@ -1,0 +1,534 @@
+[
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:0:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:0:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:1:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:1:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:2:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:2:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:3:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:3:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:4:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:4:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:5:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:5:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:6:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:6:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:7:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:7:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:8:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:8:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:9:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:9:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:10:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:10:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "You stumble into a crowd yelling, \"Aussie Aussie Aussie,\" and there is only one thing to do.",
+        "button_label": "Oi! Oi! Oi!",
+        "custom_id": "adventure-option:11:0",
+        "outcome": "⏣ 50,000",
+        "outcome_2": null
+    },
+    {
+        "description": "You stumble into a crowd yelling, \"Aussie Aussie Aussie,\" and there is only one thing to do.",
+        "button_label": "Ignore it",
+        "custom_id": "adventure-option:11:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "While hiking through the woods north of Victoria, you hear a deep, throaty growl. It almost sounds like a dinosaur, but that would be silly…",
+        "button_label": "Find the source",
+        "custom_id": "adventure-option:12:0",
+        "outcome": "<a:KoalaPet:1397658544068624485> Koala Pet",
+        "outcome_2": null
+    },
+    {
+        "description": "While hiking through the woods north of Victoria, you hear a deep, throaty growl. It almost sounds like a dinosaur, but that would be silly…",
+        "button_label": "Run Away",
+        "custom_id": "adventure-option:12:1",
+        "outcome": "1 <a:Compass:1369060302674464871> Adventure Compass",
+        "outcome_2": null
+    },
+    {
+        "description": "While out drinking with some new mates, they find out you’ve never had Vegemite and declare it's your time. They hand you a jar and a spoon.",
+        "button_label": "Little Bite",
+        "custom_id": "adventure-option:13:0",
+        "outcome": "2 <:Cookie:1369060314074578997> Cookie",
+        "outcome_2": null
+    },
+    {
+        "description": "While out drinking with some new mates, they find out you’ve never had Vegemite and declare it's your time. They hand you a jar and a spoon.",
+        "button_label": "Big Bite",
+        "custom_id": "adventure-option:13:1",
+        "outcome": "1 <a:PepemiteIT:1397620813712068658> Pepemite",
+        "outcome_2": null
+    },
+    {
+        "description": "While out drinking with some new mates, they find out you’ve never had Vegemite and declare it's your time. They hand you a jar and a spoon.",
+        "button_label": "Pass",
+        "custom_id": "adventure-option:13:2",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "While exploring the Outback, you get a little lost but find some footprints near a creek.",
+        "button_label": "Follow the footprints",
+        "custom_id": "adventure-option:14:0",
+        "outcome": "1 <a:WoodBoxClosed:1369075419713900554> Old Box",
+        "outcome_2": null
+    },
+    {
+        "description": "While exploring the Outback, you get a little lost but find some footprints near a creek.",
+        "button_label": "Follow the creek",
+        "custom_id": "adventure-option:14:1",
+        "outcome": "1 <a:CaneToadIT:1397620809614491689> Cane Toad",
+        "outcome_2": null
+    },
+    {
+        "description": "While searching your suitcase for your favorite thongs, one of your socks wiggles on its own.",
+        "button_label": "Deal with it another day",
+        "custom_id": "adventure-option:15:0",
+        "outcome": "1 <a:GiantCentipedeIT:1397620812034605176> Giant Centipede",
+        "outcome_2": null
+    },
+    {
+        "description": "While searching your suitcase for your favorite thongs, one of your socks wiggles on its own.",
+        "button_label": "Lift the sock",
+        "custom_id": "adventure-option:15:1",
+        "outcome": "1 <a:GiantCentipedeIT:1397620812034605176> Giant Centipede",
+        "outcome_2": null
+    },
+    {
+        "description": "You meet a nice gal at Macca's who tells you she can take you to see some animals – for a price.",
+        "button_label": "Pay up",
+        "custom_id": "adventure-option:16:0",
+        "outcome": "1 <a:EchidnaIT:1397620803662643362> Echidna",
+        "outcome_2": null
+    },
+    {
+        "description": "You meet a nice gal at Macca's who tells you she can take you to see some animals – for a price.",
+        "button_label": "Ask for a discount",
+        "custom_id": "adventure-option:16:1",
+        "outcome": "1 <:Coupon:1369060341471907860> Shop Coupon",
+        "outcome_2": null
+    },
+    {
+        "description": "Is that a snake in your bed, or are you just happy to... wait, no that's definitely a snake!",
+        "button_label": "Scream",
+        "custom_id": "adventure-option:17:0",
+        "outcome": "1 <:BakeggCake:1369060258152054877> Chocolate Cake",
+        "outcome_2": null
+    },
+    {
+        "description": "Is that a snake in your bed, or are you just happy to... wait, no that's definitely a snake!",
+        "button_label": "Run",
+        "custom_id": "adventure-option:17:1",
+        "outcome": "⏣ 150,000",
+        "outcome_2": null
+    },
+    {
+        "description": "Is that a snake in your bed, or are you just happy to... wait, no that's definitely a snake!",
+        "button_label": "Freeze",
+        "custom_id": "adventure-option:17:2",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "You stumble upon an underground kangaroo fight club.",
+        "button_label": "Fight",
+        "custom_id": "adventure-option:18:0",
+        "outcome": "1 <a:PepeMedal:1369075486390485003> Pepe Medal",
+        "outcome_2": null
+    },
+    {
+        "description": "You stumble upon an underground kangaroo fight club.",
+        "button_label": "Place a bet",
+        "custom_id": "adventure-option:18:1",
+        "outcome": "⏣ 1,000,000",
+        "outcome_2": null
+    },
+    {
+        "description": "You stumble upon an underground kangaroo fight club.",
+        "button_label": "Report it",
+        "custom_id": "adventure-option:18:2",
+        "outcome": "1 <:CoinVoucher:1369060290578219109> Coin Voucher",
+        "outcome_2": null
+    },
+    {
+        "description": "When you return to your hotel, you find a spider has taken up residence in your room.",
+        "button_label": "Burn the place down",
+        "custom_id": "adventure-option:19:0",
+        "outcome": "1 <a:ExclusiveWebsiteBoxClosed:1369070513065951314> Exclusive Gems Box",
+        "outcome_2": null
+    },
+    {
+        "description": "When you return to your hotel, you find a spider has taken up residence in your room.",
+        "button_label": "Kill it",
+        "custom_id": "adventure-option:19:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "When you return to your hotel, you find a spider has taken up residence in your room.",
+        "button_label": "Leave it be",
+        "custom_id": "adventure-option:19:2",
+        "outcome": "<a:SydneySpiderPet:1397659395545890938> Funnel Web Spider Pet",
+        "outcome_2": null
+    },
+    {
+        "description": "You meet someone who looks like the God of Thunder at the beach, and he offers to teach you to surf.",
+        "button_label": "Hit the waves",
+        "custom_id": "adventure-option:20:0",
+        "outcome": "⏣ 50,000",
+        "outcome_2": null
+    },
+    {
+        "description": "You meet someone who looks like the God of Thunder at the beach, and he offers to teach you to surf.",
+        "button_label": "Sit and watch",
+        "custom_id": "adventure-option:20:1",
+        "outcome": "2 <:Alcohol:1369055414066614383> Alcohol",
+        "outcome_2": null
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:21:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:21:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "A scuba diving group invites you on an outing to explore the Great Barrier Reef.",
+        "button_label": "Explore alone",
+        "custom_id": "adventure-option:22:0",
+        "outcome": "1 <:Camera:1369055491677753474> Camera",
+        "outcome_2": null
+    },
+    {
+        "description": "A scuba diving group invites you on an outing to explore the Great Barrier Reef.",
+        "button_label": "Stay together",
+        "custom_id": "adventure-option:22:1",
+        "outcome": "1 <a:DankBoxClosed:1369060403430166598> Dank Box",
+        "outcome_2": null
+    },
+    {
+        "description": "There's so much to do, you can't decide where to go next.",
+        "button_label": "Go hunting",
+        "custom_id": "adventure-option:23:0",
+        "outcome": "1 <a:BoomerangIT:1397620806288412904> Boomerang",
+        "outcome_2": null
+    },
+    {
+        "description": "There's so much to do, you can't decide where to go next.",
+        "button_label": "Explore the Outback",
+        "custom_id": "adventure-option:23:1",
+        "outcome": "1 <a:EchidnaIT:1397620803662643362> Echidna",
+        "outcome_2": null
+    },
+    {
+        "description": "There's so much to do, you can't decide where to go next.",
+        "button_label": "Hit the beach",
+        "custom_id": "adventure-option:23:2",
+        "outcome": "1 <a:BoomerangIT:1397620806288412904> Boomerang",
+        "outcome_2": null
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:24:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:24:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "One of your new friends asks you to, \"Chuck a sickie and grab a stubby,\" and you aren't sure how to respond.",
+        "button_label": "Say yes",
+        "custom_id": "adventure-option:25:0",
+        "outcome": "1 <a:CaneToadIT:1397620809614491689> Cane Toad",
+        "outcome_2": null
+    },
+    {
+        "description": "One of your new friends asks you to, \"Chuck a sickie and grab a stubby,\" and you aren't sure how to respond.",
+        "button_label": "Say no",
+        "custom_id": "adventure-option:25:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "You meet a website designer in a coffee shop and he gives you his business card.",
+        "button_label": "Hire him",
+        "custom_id": "adventure-option:26:0",
+        "outcome": "1 <a:BluesPlane:1369055469900927027> Blue's Plane",
+        "outcome_2": null
+    },
+    {
+        "description": "You meet a website designer in a coffee shop and he gives you his business card.",
+        "button_label": "Throw it away",
+        "custom_id": "adventure-option:26:1",
+        "outcome": null,
+        "outcome_2": null
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:27:0",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "",
+        "button_label": "",
+        "custom_id": "adventure-option:27:1",
+        "outcome": "?",
+        "outcome_2": "?"
+    },
+    {
+        "description": "While you're driving along, a wallaby, a kangaroo, and a crocodile cross the road.",
+        "button_label": "Why?",
+        "custom_id": "adventure-option:28:0",
+        "outcome": "+25% Luck Multiplier for 30m",
+        "outcome_2": null
+    },
+    {
+        "description": "While you're driving along, a wallaby, a kangaroo, and a crocodile cross the road.",
+        "button_label": "Sweet!",
+        "custom_id": "adventure-option:28:1",
+        "outcome": "1 <:AdventureVoucher:1369055406047100972> Adventure Voucher",
+        "outcome_2": null
+    },
+    {
+        "description": "One night you're invited to a gathering on the beach, and it turns out to be a barbecue.",
+        "button_label": "Eat up",
+        "custom_id": "adventure-option:29:0",
+        "outcome": "1 <a:GiantCentipedeIT:1397620812034605176> Giant Centipede",
+        "outcome_2": null
+    },
+    {
+        "description": "One night you're invited to a gathering on the beach, and it turns out to be a barbecue.",
+        "button_label": "Wander alone",
+        "custom_id": "adventure-option:29:1",
+        "outcome": "1 <:messageinaBottle:1369075353406144584> Message In a Bottle",
+        "outcome_2": null
+    },
+    {
+        "description": "The beautiful Great Barrier Reef has inspired you. What do you do with this newly found source of inspiration?",
+        "button_label": "Admire the view",
+        "custom_id": "adventure-option:30:0",
+        "outcome": "<:PetRoomStyle:1397626695619444797> Great Barrier Walls Style\n2 - 15 <:FishToken:1371084718388416565> Fish Tokens",
+        "outcome_2": null
+    },
+    {
+        "description": "The beautiful Great Barrier Reef has inspired you. What do you do with this newly found source of inspiration?",
+        "button_label": "Go snorkeling",
+        "custom_id": "adventure-option:30:1",
+        "outcome": "<:PetRoomStyle:1397626695619444797> Great Barrier Floor Style\n2 - 15 <:FishToken:1371084718388416565> Fish Tokens",
+        "outcome_2": null
+    },
+    {
+        "description": "The beautiful Great Barrier Reef has inspired you. What do you do with this newly found source of inspiration?",
+        "button_label": "Go fishing",
+        "custom_id": "adventure-option:30:2",
+        "outcome": "1 <a:FishTackleBoxIT:1369070543667593269> Fish Tackle Box",
+        "outcome_2": null
+    },
+    {
+        "description": "While walking around Kangaroo Island you stumble across an egg on the ground. What do you do with it?",
+        "button_label": "Eat it raw",
+        "custom_id": "adventure-option:31:0",
+        "outcome": "1 <a:GodBoxClose:1369070552832147577> God Box\n'God Viewer' Title",
+        "outcome_2": null
+    },
+    {
+        "description": "While walking around Kangaroo Island you stumble across an egg on the ground. What do you do with it?",
+        "button_label": "Cook it",
+        "custom_id": "adventure-option:31:1",
+        "outcome": "1 <a:eggsPan:1369060308697612359> Cooked Eggs\n'Egg Cook' Title",
+        "outcome_2": null
+    },
+    {
+        "description": "While walking around Kangaroo Island you stumble across an egg on the ground. What do you do with it?",
+        "button_label": "Take it home",
+        "custom_id": "adventure-option:31:2",
+        "outcome": "1 <a:EchidnaIT:1397620803662643362> Echidna",
+        "outcome_2": null
+    },
+    {
+        "description": "You visit an animal sanctuary and learn a lot. What do you get from the gift shop?",
+        "button_label": "Koala Sign",
+        "custom_id": "adventure-option:32:0",
+        "outcome": "<:PetRoomStyle:1397626695619444797> Koala Drop Sign Style",
+        "outcome_2": null
+    },
+    {
+        "description": "You visit an animal sanctuary and learn a lot. What do you get from the gift shop?",
+        "button_label": "War Emu Statue",
+        "custom_id": "adventure-option:32:1",
+        "outcome": "<:PetRoomStyle:1397626695619444797> War Emu Bust Style",
+        "outcome_2": null
+    },
+    {
+        "description": "You visit an animal sanctuary and learn a lot. What do you get from the gift shop?",
+        "button_label": "Toy Spider Nest",
+        "custom_id": "adventure-option:32:2",
+        "outcome": "<:PetRoomStyle:1397626695619444797> Spider Nest Style",
+        "outcome_2": null
+    },
+    {
+        "description": "You visit an animal sanctuary and learn a lot. What do you get from the gift shop?",
+        "button_label": "Australia Map",
+        "custom_id": "adventure-option:32:3",
+        "outcome": "<:PetRoomStyle:1397626695619444797> Framed Australia Map Style",
+        "outcome_2": null
+    },
+    {
+        "description": "You visit an animal sanctuary and learn a lot. What do you get from the gift shop?",
+        "button_label": "Nothing",
+        "custom_id": "adventure-option:32:4",
+        "outcome": "1 <:Broom:1390044280831086665> Broom",
+        "outcome_2": null
+    }
+]
