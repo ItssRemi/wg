@@ -68,6 +68,16 @@ ADVENTURE_END_PHRASES = (
     "your adventure has ended.",
 )
 
+def split_adventure_result(result_text: str = "") -> tuple[str, str]:
+    """Split an adventure result into story text and user-side outcome."""
+    result_text = str(result_text or "").strip()
+
+    if "\n\n" not in result_text:
+        return result_text, ""
+
+    story_text, outcome_text = result_text.split("\n\n", 1)
+
+    return story_text.strip(), outcome_text.strip().lstrip("-").strip()
 
 def classify_adventure_outcome(
     result_text: str = "",
