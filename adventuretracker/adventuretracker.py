@@ -45,6 +45,62 @@ log = logging.getLogger("red.nebula.AdventureTracker")
 DURATION_RE = re.compile(r"(?:next|for the next)\s+(\d+)\s*(minute|hour|day)s?", re.IGNORECASE)
 
 
+NOTHING_HAPPENED_PHRASES = (
+    "nothing ventured, nothing gained - or lost, in this case.",
+    "seems like a typical day in your story - nothing's changed.",
+    "nothing interesting happened.",
+    "just a footnote in your adventure saga - carry on!",
+    "it's just another moment in time, nothing to see here.",
+    "all's quiet on the adventure front - for now.",
+    "despite the intrigue, your situation remains unaffected.",
+)
+
+# Matches custom and animated Discord emoji formats, including legacy
+# emoji names containing mixed case.
+ADVENTURE_REWARD_PATTERN = re.compile(
+    r"-\s*\d+\s+"
+    r"(?:<a?:[A-Za-z0-9_]+:\d+>|:[A-Za-z0-9_]+:)"
+    r"\s+.+",
+    re.IGNORECASE,
+)
+
+ADVENTURE_END_PHRASES = (
+    "your adventure has ended.",
+)
+
+
+def classify_adventure_outcome(
+    result_text: str = "",
+    ending_type: Optional[str] = None,
+) -> str:
+    """Classify the player-side outcome independently of story text."""
+    result = " ".join(str(result_text or "").casefold().split())
+
+    if not result:
+        return "unclassified"
+
+    if ending_type:
+        return "premature_end"
+
+    if any(phrase in result for phrase in ADVENTURE_END_PHRASES):
+        return "premature_end"
+
+    # The final hyphen-separated segment contains the player-side outcome.
+    # Story text before that segment must not affect classification.
+    parts = re.split(r"\s+-\s+", result)
+    player_outcome = parts[-1].strip()
+
+    if any(
+        phrase in player_outcome
+        for phrase in NOTHING_HAPPENED_PHRASES
+    ):
+        return "nothing_happened"
+
+    if ADVENTURE_REWARD_PATTERN.search(player_outcome):
+        return "reward"
+
+    return "unclassified"
+
 class _AdventureStatsNavButton(discord.ui.Button):
     """One of the owner-locked navigation controls on the stats menu."""
 
@@ -912,6 +968,20 @@ class AdventureTracker(commands.Cog):
         selected_cid, selected_label = selected_component(payload.get("components") or [])
         prompt_text = str(run.get("current_prompt_text") or "")
         ending_type, fatal_end, lose_all = classify_ending(result_text)
+        story_text, outcome_text = split_adventure_result(result_text)
+        outcome_classification = classify_adventure_outcome(outcome_text)
+        if outcome_classification == "unclassified":
+            log.warning(
+                "Unclassified adventure outcome | "
+                "run=%s | message=%s | adventure=%s | "
+                "choice=%r | prompt=%r | result=%r",
+                message_id,
+                message_id,
+                adventure_key,
+                selected_label,
+                prompt_text,
+                result_text,
+            )
         item_losses = self.reward_parser.parse_item_losses(result_text)
         parsed_rewards = self.reward_parser.parse(result_text, adventure_key, source="live")
         compass_marker = any(emoji_id in COMPASS_EMOJI_IDS for emoji_id in self._all_emoji_ids(result_text))
@@ -951,6 +1021,7 @@ class AdventureTracker(commands.Cog):
             "prompt_text": prompt_text,
             "result_text": result_text,
             "ending_type": ending_type,
+            "outcome_classification": outcome_classification,
             "fatal_end": fatal_end,
             "lose_all": lose_all,
             "item_losses": item_losses,
