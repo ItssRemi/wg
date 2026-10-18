@@ -145,6 +145,7 @@ class AdventureDB:
                     prompt_text TEXT,
                     result_text TEXT NOT NULL,
                     ending_type TEXT,
+                    outcome_classification TEXT NOT NULL DEFAULT 'unclassified',
                     fatal_end INTEGER NOT NULL DEFAULT 0,
                     lose_all INTEGER NOT NULL DEFAULT 0,
                     item_losses_json TEXT NOT NULL DEFAULT '[]',
@@ -291,6 +292,17 @@ class AdventureDB:
                 """
             )
             run_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(adventure_runs)").fetchall()}
+            node_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(node_events)").fetchall()
+            }
+            if "outcome_classification" not in node_columns:
+                conn.execute(
+                    """
+                    ALTER TABLE node_events
+                    ADD COLUMN outcome_classification TEXT NOT NULL DEFAULT 'unclassified'
+                    """
+                ) 
             if "selected_items_observed" not in run_columns:
                 conn.execute(
                     "ALTER TABLE adventure_runs ADD COLUMN selected_items_observed INTEGER NOT NULL DEFAULT 0"
@@ -544,34 +556,77 @@ class AdventureDB:
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO node_events(
-                        message_id,event_hash,occurred_at,selected_custom_id,selected_label,prompt_text,result_text,
-                        ending_type,fatal_end,lose_all,item_losses_json,parsed_rewards_json,compass_marker,
-                        compass_proc,doubled_components_json,compass_bonus_net,compass_bonus_market,
-                        compass_bonus_coins,raw_json
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        message_id,
+                        event_hash,
+                        occurred_at,
+                        selected_custom_id,
+                        selected_label,
+                        prompt_text,
+                        result_text,
+                        ending_type,
+                        outcome_classification,
+                        fatal_end,
+                        lose_all,
+                        item_losses_json,
+                        parsed_rewards_json,
+                        compass_marker,
+                        compass_proc,
+                        doubled_components_json,
+                        compass_bonus_net,
+                        compass_bonus_market,
+                        compass_bonus_coins,
+                        raw_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        run_message_id, event["event_hash"], event["occurred_at"], event.get("selected_custom_id"),
-                        event.get("selected_label"), event.get("prompt_text"), event.get("result_text", ""),
-                        event.get("ending_type"), int(bool(event.get("fatal_end"))), int(bool(event.get("lose_all"))),
-                        dumps(event.get("item_losses", [])), dumps(event.get("parsed_rewards", [])),
-                        int(bool(event.get("compass_marker"))), int(bool(event.get("compass_proc"))),
-                        dumps(event.get("doubled_components", [])), int(event.get("compass_bonus_net", 0)),
-                        int(event.get("compass_bonus_market", 0)), int(event.get("compass_bonus_coins", 0)),
+                        run_message_id,
+                        event["event_hash"],
+                        event["occurred_at"],
+                        event.get("selected_custom_id"),
+                        event.get("selected_label"),
+                        event.get("prompt_text"),
+                        event.get("result_text", ""),
+                        event.get("ending_type"),
+                        event.get("outcome_classification", "unclassified"),
+                        int(bool(event.get("fatal_end"))),
+                        int(bool(event.get("lose_all"))),
+                        dumps(event.get("item_losses", [])),
+                        dumps(event.get("parsed_rewards", [])),
+                        int(bool(event.get("compass_marker"))),
+                        int(bool(event.get("compass_proc"))),
+                        dumps(event.get("doubled_components", [])),
+                        int(event.get("compass_bonus_net", 0)),
+                        int(event.get("compass_bonus_market", 0)),
+                        int(event.get("compass_bonus_coins", 0)),
                         dumps(event.get("raw", {})),
                     ),
                 )
+
                 if cur.rowcount == 0:
                     row = conn.execute(
-                        "SELECT id FROM node_events WHERE message_id=? AND event_hash=?",
+                        """
+                        SELECT id FROM node_events
+                        WHERE message_id=? AND event_hash=?
+                        """,
                         (run_message_id, event["event_hash"]),
                     ).fetchone()
                     return int(row[0]) if row else None
+
                 node_id = int(cur.lastrowid)
+
                 if event.get("fatal_end") or event.get("item_losses"):
-                    run = conn.execute("SELECT node_item_losses_json, ending_type, ending_text FROM adventure_runs WHERE message_id=?", (run_message_id,)).fetchone()
+                    run = conn.execute(
+                        """
+                        SELECT node_item_losses_json, ending_type, ending_text
+                        FROM adventure_runs
+                        WHERE message_id=?
+                        """,
+                        (run_message_id,),
+                    ).fetchone()
+
                     prior = loads(run[0] if run else None, [])
                     prior.extend(event.get("item_losses", []))
+
                     conn.execute(
                         """
                         UPDATE adventure_runs SET
@@ -584,15 +639,27 @@ class AdventureDB:
                         WHERE message_id=?
                         """,
                         (
-                            dumps(prior), event.get("ending_type", ""), event.get("ending_type", ""),
+                            dumps(prior),
+                            event.get("ending_type", ""),
+                            event.get("ending_type", ""),
                             event.get("result_text", "") if event.get("fatal_end") else "",
                             event.get("result_text", "") if event.get("fatal_end") else "",
-                            int(bool(event.get("fatal_end"))), int(bool(event.get("lose_all"))),
-                            event["occurred_at"], run_message_id,
+                            int(bool(event.get("fatal_end"))),
+                            int(bool(event.get("lose_all"))),
+                            event["occurred_at"],
+                            run_message_id,
                         ),
                     )
                 else:
-                    conn.execute("UPDATE adventure_runs SET last_seen_at=? WHERE message_id=?", (event["occurred_at"], run_message_id))
+                    conn.execute(
+                        """
+                        UPDATE adventure_runs
+                        SET last_seen_at=?
+                        WHERE message_id=?
+                        """,
+                        (event["occurred_at"], run_message_id),
+                    )
+
                 if event.get("compass_proc"):
                     components = event.get("doubled_components", [])
                     conn.execute(
@@ -605,12 +672,18 @@ class AdventureDB:
                             compass_bonus_coins=compass_bonus_coins+?
                         WHERE message_id=?
                         """,
-                        (len(components), int(event.get("compass_bonus_net", 0)),
-                         int(event.get("compass_bonus_market", 0)), int(event.get("compass_bonus_coins", 0)),
-                         run_message_id),
+                        (
+                            len(components),
+                            int(event.get("compass_bonus_net", 0)),
+                            int(event.get("compass_bonus_market", 0)),
+                            int(event.get("compass_bonus_coins", 0)),
+                            run_message_id,
+                        ),
                     )
+
                 conn.commit()
                 return node_id
+
         return await self._run(op)
 
     async def add_luck_observation(self, observation: Dict[str, Any]) -> int:
