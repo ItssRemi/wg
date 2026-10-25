@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import discord
 
-from .audit_engine import WAIFUGAMI_ID
+from .audit_engine import WAIFUGAMI_ID, GOOD_SKILL, GOOD_LUCK
 
 log = logging.getLogger("red.wg.dupes")
 
@@ -46,11 +46,8 @@ DUPES_FAV_BATCH = 20              # ids per `.fav` command
 DUPES_MESSAGE_LIMIT = 1900        # stay under Discord's 2000-char limit
 TRASH_EMOJI = "🚮"
 
-# Skill decides first. A copy is "good" (always kept) only when its Skill
-# reaches GOOD_SKILL AND its Luck reaches GOOD_LUCK. Luck can never rescue a
-# low-Skill card. These are separate from the main audit thresholds on purpose.
-GOOD_SKILL = 90.0
-GOOD_LUCK = 6
+# GOOD_SKILL and GOOD_LUCK are imported from audit_engine so both workflows
+# share a single source of truth.  Do not redefine them here.
 
 _LIST_TITLE_RE = re.compile(r"^.+?'s Waifus \(Page (\d+)\)$", re.I)
 _LIST_ENTRY_RE = re.compile(r"^(\d+)\s*\|\s*(.+?)\s*$", re.M)
@@ -596,7 +593,7 @@ class DupesMixin:
             f"**Duplicate review complete** · scanned {scope}\n"
             f"`{groups}` characters with duplicates · "
             f"keeping `{len(keep)}` · trashing `{len(final_trash)}`\n"
-            f"-# Kept: Skill ≥ {GOOD_SKILL:g} with Luck ≥ {GOOD_LUCK}. "
+            f"-# Kept: Skill > {GOOD_SKILL:g} and Luck ≥ {GOOD_LUCK}. "
             "If no copy qualifies, only the highest-Skill copy is kept "
             "(Luck breaks ties)."
         )
