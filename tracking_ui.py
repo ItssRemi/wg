@@ -664,11 +664,11 @@ class TrackingUIMixin:
                 "components": [
                     {"type": 1, "components": [{
                         "type": 4, "custom_id": "series", "style": 1,
-                        "label": "Series (ID or name)", "required": True, "max_length": 100,
+                        "label": "Series (optional, ID or name)", "required": False, "max_length": 100,
                     }]},
                     {"type": 1, "components": [{
                         "type": 4, "custom_id": "character", "style": 1,
-                        "label": "Character (ID or name)", "required": True, "max_length": 100,
+                        "label": "Character (optional, ID or name)", "required": False, "max_length": 100,
                     }]},
                 ],
             }
@@ -711,30 +711,134 @@ class TrackingUIMixin:
             return
 
         if kind == "addchar":
-            sid = await self._resolve_series_id_text(fields.get("series", ""))
-            if sid is None:
+            series_text = (fields.get("series") or "").strip()
+            character_text = (fields.get("character") or "").strip()
+
+            if not series_text and not character_text:
                 await interaction.response.send_message(
-                    f"I don't recognize a series matching {fields.get('series', '')!r}.", ephemeral=True
-                )
-                return
-            resolved = self._resolve_character_in_series(sid, fields.get("character", ""))
-            if resolved is None:
-                await interaction.response.send_message(
-                    f"I don't recognize a character matching {fields.get('character', '')!r} "
-                    f"in ({sid}) {self._series_index.get(sid, 'Unknown series')}.",
+                    "Enter a series, a character, or both. At least one field is required.",
                     ephemeral=True,
                 )
                 return
-            cid, _cname = resolved
+
+            # Series only: track the entire series.
+            if series_text and not character_text:
+                sid = await self._resolve_series_id_text(series_text)
+                if sid is None:
+                    await interaction.response.send_message(
+                        f"I don't recognize a series matching {series_text!r}.",
+                        ephemeral=True,
+                    )
+                    return
+
+                await self._add_series_tracking(owner_id, sid)
+                payload = await self._wgtracked_payload(
+                    owner_id, category="series", page=0, mode="view"
+                )
+                route = Route(
+                    "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                    interaction_id=interaction.id, interaction_token=interaction.token,
+                )
+                await self.bot.http.request(route, json={"type": 4, "data": payload})
+                return
+
+            # Both fields: resolve the character within the specified series.
+            if series_text:
+                sid = await self._resolve_series_id_text(series_text)
+                if sid is None:
+                    await interaction.response.send_message(
+                        f"I don't recognize a series matching {series_text!r}.",
+                        ephemeral=True,
+                    )
+                    return
+
+                resolved = self._resolve_character_in_series(sid, character_text)
+                if resolved is None:
+                    await interaction.response.send_message(
+                        f"I couldn't uniquely identify {character_text!r} "
+                        f"in ({sid}) {self._series_index.get(sid, 'Unknown series')}. "
+                        "Check the name or enter the character ID.",
+                        ephemeral=True,
+                    )
+                    return
+
+                cid, _cname = resolved
+
+            # Character only: search the entire catalog.
+            else:
+                matches = []
+
+                if character_text.isdigit():
+                    cid_lookup = str(int(character_text))
+                    entry = self._char_index.get(cid_lookup)
+                    if isinstance(entry, dict):
+                        matches = [(cid_lookup, entry)]
+                else:
+                    needle = character_text.casefold()
+
+                    # Prefer exact matches.
+                    matches = [
+                        (str(cid), entry)
+                        for cid, entry in self._char_index.items()
+                        if isinstance(entry, dict)
+                        and str(entry.get("name") or "").strip().casefold() == needle
+                    ]
+
+                    # Only try partial matches if no exact match exists.
+                    if not matches:
+                        matches = [
+                            (str(cid), entry)
+                            for cid, entry in self._char_index.items()
+                            if isinstance(entry, dict)
+                            and needle in str(entry.get("name") or "").strip().casefold()
+                        ]
+
+                if not matches:
+                    await interaction.response.send_message(
+                        f"I couldn't find a character matching {character_text!r} in the catalog.",
+                        ephemeral=True,
+                    )
+                    return
+
+                if len(matches) > 1:
+                    series_matches = sorted({
+                        f"({entry.get('series_id')}) "
+                        f"{entry.get('series') or 'Unknown series'}"
+                        for _cid, entry in matches
+                    })
+                    preview = ", ".join(series_matches[:5])
+                    if len(series_matches) > 5:
+                        preview += f", and {len(series_matches) - 5} more"
+
+                    await interaction.response.send_message(
+                        f"More than one character matches {character_text!r}. "
+                        f"Enter its series to narrow the search. Matches include: {preview}.",
+                        ephemeral=True,
+                    )
+                    return
+
+                cid, entry = matches[0]
+                try:
+                    sid = str(int(entry.get("series_id")))
+                except (TypeError, ValueError):
+                    await interaction.response.send_message(
+                        f"I found {character_text!r}, but its series information "
+                        "is missing from the catalog.",
+                        ephemeral=True,
+                    )
+                    return
+
             await self._add_explicit_tracking(owner_id, sid, [cid])
-            payload = await self._wgtracked_payload(owner_id, category="characters", page=0, mode="view")
+            payload = await self._wgtracked_payload(
+                owner_id, category="characters", page=0, mode="view"
+            )
             route = Route(
                 "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
                 interaction_id=interaction.id, interaction_token=interaction.token,
             )
             await self.bot.http.request(route, json={"type": 4, "data": payload})
             return
-
+        
     async def _handle_wgcompletion_interaction(
         self, interaction: discord.Interaction, owner_id: int, parts: List[str]
     ) -> None:
