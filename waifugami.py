@@ -26,10 +26,11 @@ from redbot.core.data_manager import cog_data_path
 
 log = logging.getLogger("red.nebula.Waifugami")
 
-from .audit import AuditMixin      # noqa: E402  (after constants are defined above)
-from .catalog import CatalogMixin  # noqa: E402
-from .db import CardStore          # noqa: E402
-from .dupes import DupesMixin      # noqa: E402
+from .audit import AuditMixin            # noqa: E402  (after constants are defined above)
+from .catalog import CatalogMixin        # noqa: E402
+from .db import CardStore                # noqa: E402
+from .dupes import DupesMixin            # noqa: E402
+from .tracking_ui import TrackingUIMixin  # noqa: E402
 
 # ============================================================
 # Constants — card tracking (from WaifugamiCards)
@@ -111,6 +112,7 @@ KAZUHA_ORDERWL_LINE_RE = re.compile(r"^(\d+)\s*\|\s*(.+?)\s*\(\((\d+)\)\s*Wishli
 SKILL_LIST_TITLE_RE = re.compile(r"^.+?'s Waifus \(Page (\d+)\)$", re.I)
 SKILL_LIST_ID_RE = re.compile(r"^(\d+)\s*\|", re.M)
 VIEW_COMMAND_RE = re.compile(r"\.v\s+((?:\d+\s*){1,5})$", re.I)
+LIST_COMMAND_RE = re.compile(r"^\.l(?:\s|$)", re.I)
 SKILL_LIST_ENTRY_RE = re.compile(r"^(\d+)\s*\|\s*(.+?)\s*$", re.M)
 DAILY_COMMAND_RE = re.compile(r"\.daily\s*$", re.I)
 DAILYGACHA_COMMAND_RE = re.compile(r"\.dailygacha\s*$", re.I)
@@ -150,6 +152,7 @@ TEAM_ADD_SUCCESS_RE = re.compile(
     r"managed to add the character to the team", re.I
 )
 TEAM_MUTATION_TTL = 30
+ONBOARDING_NUDGE_TTL = 10 * 60
 
 QUEST_RANK_INFO = {
     "F": {"minutes": 10, "dp": 20},
@@ -261,58 +264,9 @@ def chunk(items: List[Any], size: int):
 def md5_hash(value: str) -> str:
     return hashlib.md5(value.encode()).hexdigest()
 
-class WGTrackedView(discord.ui.View):
-    def __init__(
-        self,
-        *,
-        invoker_user_id: int,
-        pages: List[discord.Embed],
-        timeout: int = 180,
-    ):
-        super().__init__(timeout=timeout)
-        self.invoker_user_id = invoker_user_id
-        self.pages = pages
-        self.page_index = 0
-        self._sync_buttons()
-
-    def _sync_buttons(self) -> None:
-        self.first.disabled = self.page_index <= 0
-        self.prev.disabled = self.page_index <= 0
-        self.next.disabled = self.page_index >= (len(self.pages) - 1)
-        self.last.disabled = self.page_index >= (len(self.pages) - 1)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.invoker_user_id:
-            await interaction.response.send_message("This paginator is not for you.", ephemeral=True)
-            return False
-        return True
-
-    async def _edit(self, interaction: discord.Interaction) -> None:
-        self._sync_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.page_index], view=self)
-
-    @discord.ui.button(emoji="⏪", style=discord.ButtonStyle.primary)
-    async def first(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        self.page_index = 0
-        await self._edit(interaction)
-
-    @discord.ui.button(emoji="⬅", style=discord.ButtonStyle.primary)
-    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        self.page_index = max(0, self.page_index - 1)
-        await self._edit(interaction)
-
-    @discord.ui.button(emoji="➡", style=discord.ButtonStyle.primary)
-    async def next(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        self.page_index = min(len(self.pages) - 1, self.page_index + 1)
-        await self._edit(interaction)
-
-    @discord.ui.button(emoji="⏩", style=discord.ButtonStyle.primary)
-    async def last(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        self.page_index = len(self.pages) - 1
-        await self._edit(interaction)
 
 
-class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
+class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.Cog):
     """Waifugami card tracking, team building, and spawn assistant.
 
     Run ``[p]help wg`` to see every Waifugami command in one place.
@@ -379,11 +333,23 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         self._pending_team_commands: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._pending_team_adds: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._team_previews: Dict[int, Dict[str, Any]] = {}
-        self._scan_sessions: Dict[int, Dict[str, Any]] = {}
-        self._scan_list_owners: Dict[int, int] = {}
+        # Keyed by (user_id, guild_id), not bare user_id: a user can be mid-scan
+        # in one server and start an unrelated `.l -orderby skill` flow in
+        # another, and those are two independent sessions, not one that the
+        # second silently stomps. See _finish_scan_session for the matching
+        # pop logic.
+        self._scan_sessions: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        self._scan_list_owners: Dict[int, Tuple[int, int]] = {}
         self._pending_ad_commands: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._pending_dispatches: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._pending_end_commands: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
+        # Onboarding nudge: user IDs that just ran `wgtrack enable` and were
+        # told to run `.l -orderby skill`, but haven't yet been told what to
+        # reply with. Cleared the first time we see their `.l` embed come
+        # back (or after ONBOARDING_NUDGE_TTL, so a stale flag can't fire on
+        # an unrelated `.l` days later).
+        self._pending_first_scan_nudge: Dict[int, float] = {}
+        self._pending_list_commands: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._pending_cooldown_commands: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._questboards: Dict[int, Dict[str, Any]] = {}
         self._reminder_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
@@ -398,7 +364,10 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         # Trade-confirmation dedup (bounded, matches CACHE_CAP idiom)
         self._trade_confirmed_seen: Deque[int] = deque(maxlen=200)
         # WL learn sessions: user_id -> session dict
-        self._active_wl_sessions: Dict[int, Dict[str, Any]] = {}
+        # Keyed by (user_id, guild_id) for the same reason as _scan_sessions
+        # above: a WL-learn session in one guild must not get silently
+        # cancelled by the user starting another one somewhere else.
+        self._active_wl_sessions: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
         # ---- spawn listener config & state (from WaifugamiListener) ----
         base = Path(__file__).parent
@@ -407,6 +376,8 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
 
         # ---- catalog storage (CatalogMixin) ----
         self._catalog_init()
+        # ---- /wgtracked, /wgcompletion (TrackingUIMixin) ----
+        self._tracking_ui_init()
 
         self._event_seen: Dict[int, bool] = {}
         self._announced: Dict[int, str] = {}
@@ -431,29 +402,35 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
             event_role_id=self.DEFAULT_EVENT_ROLE_ID,
             event_channel_ids=[],
             auto_remove_on_hit=True,
-            tracked_users_by_series={},
             series_watchers_by_series={},
             tier_alert_user_ids=[],
             tier_alert_user_ids_by_tier={},
-            # ---- split completion/tracking architecture ----
+            # Tracking architecture — three independent subscription kinds,
+            # each with its own primary (per-user) field and global reverse
+            # index. Neither primary nor reverse index is authoritative on
+            # its own; _tracking_add/_tracking_remove_one/_tracking_remove
+            # keep both in lockstep on every write (see their definitions).
             completion_users_by_series={},
             character_tracked_users_by_series={},
-            completion_schema_migrated=False,
             # ---- .i <id> catalog learning ----
             wishlist_by_waifu_id={},
             event_catalog = {},
             event_aliases = {}
         )
         self.listener_config.register_user(
-            wanted_by_series={},
-            watched_series=[],
-            # ---- split completion/tracking architecture ----
-            # completion_missing_by_series: what the user still needs, kept in
-            # sync (added AND removed) by `.wgscan`. Independent of...
+            # tracked_series: series-level "notify me about any new spawn in
+            # this series" subscriptions. Reverse index: series_watchers_by_series.
+            tracked_series=[],
+            # completion_missing_by_series: what `.wgscan` has harvested as
+            # still-missing per series. Kept in sync (added AND removed) by
+            # scans; see _scan_completion_message's `suspicious`/`full_pass`
+            # guards for when a scan is trusted to remove entries.
+            # Reverse index: completion_users_by_series.
             completion_missing_by_series={},
-            # tracked_characters_by_series: characters the user explicitly
-            # asked to be told about via `wgtrackid`, regardless of whether
-            # they've since obtained them.
+            # tracked_characters_by_series: characters explicitly subscribed
+            # to via /wgtracked, grouped by series ID, independent of
+            # ownership or completion status.
+            # Reverse index: character_tracked_users_by_series.
             tracked_characters_by_series={},
         )
 
@@ -476,57 +453,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         await self._load_event_overrides()
         await self._load_catalogs()
         self.bot.tree.add_command(self._name_context_menu, override=True)
-        await self._migrate_completion_tracking_schema()
         log.info("Waifugami cog loaded (card tracking + spawn listener merged)")
-
-    async def _migrate_completion_tracking_schema(self) -> None:
-        """One-time migration off the old conflated ``wanted_by_series``.
-
-        Historically, `.wgscan`-derived "still missing" data and explicit
-        `wgtrackid` subscriptions were the same field, so we can't tell
-        which entries were which. To avoid silently dropping anyone's
-        explicit tracking, every existing entry is copied into *both* new
-        fields — `completion_missing_by_series` (which the next `.wgscan`
-        will correct down to the true state) and `tracked_characters_by_series`
-        (which is left alone, exactly matching pre-migration behaviour,
-        until the user explicitly untracks something).
-        """
-        if await self.listener_config.completion_schema_migrated():
-            return
-
-        try:
-            all_users = await self.listener_config.all_users()
-        except Exception:
-            log.exception("Waifugami: failed to enumerate users for completion-schema migration")
-            all_users = {}
-
-        migrated_users = 0
-        for user_id, data in (all_users or {}).items():
-            wanted = data.get("wanted_by_series") if isinstance(data, dict) else None
-            if not isinstance(wanted, dict) or not wanted:
-                continue
-            user_conf = self.listener_config.user_from_id(user_id)
-            existing_missing = await user_conf.completion_missing_by_series()
-            existing_tracked = await user_conf.tracked_characters_by_series()
-            if not isinstance(existing_missing, dict):
-                existing_missing = {}
-            if not isinstance(existing_tracked, dict):
-                existing_tracked = {}
-            existing_missing.update(wanted)
-            existing_tracked.update(wanted)
-            await user_conf.completion_missing_by_series.set(existing_missing)
-            await user_conf.tracked_characters_by_series.set(existing_tracked)
-            migrated_users += 1
-
-        legacy_reverse = await self.listener_config.tracked_users_by_series()
-        if isinstance(legacy_reverse, dict) and legacy_reverse:
-            await self.listener_config.completion_users_by_series.set(dict(legacy_reverse))
-            await self.listener_config.character_tracked_users_by_series.set(dict(legacy_reverse))
-
-        await self.listener_config.completion_schema_migrated.set(True)
-        log.info(
-            "Waifugami: migrated completion/tracking schema for %d user(s)", migrated_users
-        )
 
     async def cog_unload(self) -> None:
         # card tracking
@@ -881,23 +808,39 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         Called lazily on the first card write for each user.  Safe to call
         multiple times; the migration SQL uses INSERT OR IGNORE so rows are
         never duplicated.
+
+        ``self._db_migrated`` is only an in-process cache — it resets on
+        every restart. Without a durable record of "the Config dicts are
+        already cleared", every user's first card-touch after every restart
+        would pay for two extra Config reads (``cards()``/``removed_cards()``)
+        just to re-confirm dicts that are already empty, forever. The
+        SQLite-backed ``is_config_cleared`` flag (db.py) makes that check
+        itself one-time-ever instead of one-time-per-restart.
         """
         if owner_id in self._db_migrated:
             return
+        if await self._card_store.is_config_cleared(owner_id):
+            # Already migrated AND already cleared — nothing left to check,
+            # don't touch Config at all.
+            self._db_migrated.add(owner_id)
+            return
+
         user_conf = self.config.user_from_id(owner_id)
         if await self._card_store.is_migrated(owner_id):
-            # Already migrated under this fix, or under the older code that
-            # never cleared the Config side afterward. Clear it now so the
-            # leftover blob stops bloating every Config read/write for this
-            # user (see catalog.py's module docstring for the matching bug
-            # on the catalog side — same shape of problem: large JSON
-            # sitting in the hot path of something that should be cheap).
+            # Migrated under the older code that never cleared the Config
+            # side afterward. Clear it now, once, and record that fact in
+            # SQLite so this branch never has to run again for this user
+            # (see catalog.py's module docstring for the matching bug on
+            # the catalog side — same shape of problem: large JSON sitting
+            # in the hot path of something that should be cheap).
             if await user_conf.cards() or await user_conf.removed_cards():
                 await user_conf.cards.clear()
                 await user_conf.removed_cards.clear()
                 log.info("Cleared stale Config card data owner=%s (already in SQLite)", owner_id)
+            await self._card_store.mark_config_cleared(owner_id)
             self._db_migrated.add(owner_id)
             return
+
         cards_dict = await user_conf.cards()
         removed_dict = await user_conf.removed_cards()
         if cards_dict or removed_dict:
@@ -908,6 +851,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
                 "Migrated Config card data to SQLite owner=%s active=%d removed=%d",
                 owner_id, len(cards_dict), len(removed_dict),
             )
+        await self._card_store.mark_config_cleared(owner_id)
         self._db_migrated.add(owner_id)
 
     async def _store_card(self, card: Dict[str, Any]) -> None:
@@ -1647,6 +1591,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         await self._observe_cooldown_response(message)
 
         for embed in message.embeds:
+            await self._maybe_send_first_scan_nudge(message, embed)
             quest = self._parse_questboard(embed)
             if quest:
                 await self._bind_questboard(message, quest)
@@ -1693,6 +1638,14 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
 
     async def _observe_user_command(self, message: discord.Message) -> None:
         content = (message.content or "").strip()
+
+        if LIST_COMMAND_RE.match(content) and message.author.id in self._pending_first_scan_nudge:
+            self._pending_list_commands[message.channel.id].append({
+                "user_id": message.author.id,
+                "message_id": message.id,
+                "created": time.monotonic(),
+            })
+
         team_add_match = TEAM_ADD_RE.fullmatch(content)
         if team_add_match and await self._tracking_enabled(message.author.id):
             queue = self._pending_team_adds[message.channel.id]
@@ -1874,6 +1827,38 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
 
     # ---------------------------- Guided list scanning ----------------------------
 
+    async def _maybe_send_first_scan_nudge(
+        self, message: discord.Message, embed: discord.Embed
+    ) -> None:
+        """Close the onboarding loop: `wgtrack enable` -> `.l -orderby skill`
+        -> (used to just stop here) -> now also tells the user what to
+        reply with to actually start the guided scan.
+
+        Only fires once per user: the pending flag is cleared the first
+        time we match it to a `.l` embed, whether or not that embed turns
+        out to be this user's own list (TTL'd and best-effort, same as the
+        other `_pending_*_commands` queues in this listener).
+        """
+        if not self._pending_first_scan_nudge:
+            return  # fast path: nobody is mid-onboarding right now
+        if not SKILL_LIST_TITLE_RE.fullmatch(embed.title or ""):
+            return
+
+        queue = self._pending_list_commands[message.channel.id]
+        while queue and time.monotonic() - queue[0]["created"] > ONBOARDING_NUDGE_TTL:
+            queue.popleft()
+        if not queue:
+            return
+        pending = queue.popleft()
+        self._pending_first_scan_nudge.pop(pending["user_id"], None)
+
+        await self._send_channel_v2_text(
+            message.channel,
+            "Reply to that list with `list v` to start the guided scan "
+            "(learns your current cards so I can tell new ones apart later).",
+            message.id,
+        )
+
     @staticmethod
     def _parse_skill_list(embed: discord.Embed) -> Optional[List[int]]:
         if not SKILL_LIST_TITLE_RE.fullmatch(embed.title or ""):
@@ -1991,10 +1976,12 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
                 trigger.author.id, list_message.embeds[0]
             )
 
-        self._finish_scan_session(trigger.author.id)
+        guild_id = trigger.guild.id
+        self._finish_scan_session(trigger.author.id, guild_id)
         response = await trigger.reply("Preparing the list...", mention_author=False)
         session = {
             "user_id": trigger.author.id,
+            "guild_id": guild_id,
             "channel_id": trigger.channel.id,
             "list_message_id": list_message.id,
             "guide_message_id": response.id,
@@ -2005,17 +1992,19 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
             "created": time.monotonic(),
             "mode": mode,
         }
-        self._scan_sessions[trigger.author.id] = session
-        self._scan_list_owners[list_message.id] = trigger.author.id
+        key = (trigger.author.id, guild_id)
+        self._scan_sessions[key] = session
+        self._scan_list_owners[list_message.id] = key
         await self._render_scan_session(session)
 
     async def _collect_scan_page(self, message: discord.Message) -> None:
-        user_id = self._scan_list_owners.get(message.id)
-        session = self._scan_sessions.get(user_id) if user_id is not None else None
+        key = self._scan_list_owners.get(message.id)
+        session = self._scan_sessions.get(key) if key is not None else None
         if not session or session.get("phase") != "collecting" or not message.embeds:
             return
+        user_id = key[0]
         if time.monotonic() - session["created"] > SCAN_SESSION_TTL:
-            self._finish_scan_session(user_id)
+            self._finish_scan_session(*key)
             return
         local_ids = self._parse_skill_list(message.embeds[0])
         if not local_ids:
@@ -2038,11 +2027,11 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
     async def _lock_scan_from_view(
         self, message: discord.Message, sent_ids: List[int]
     ) -> None:
-        session = self._scan_sessions.get(message.author.id)
+        session = self._scan_sessions.get((message.author.id, message.guild.id))
         if not session or session.get("channel_id") != message.channel.id:
             return
         if time.monotonic() - session["created"] > SCAN_SESSION_TTL:
-            self._finish_scan_session(message.author.id)
+            self._finish_scan_session(message.author.id, message.guild.id)
             return
         batches = self._scan_batches(session["remaining_ids"])
         if session["phase"] == "collecting":
@@ -2066,7 +2055,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         if len(owners) != 1:
             return
         user_id = next(iter(owners))
-        session = self._scan_sessions.get(user_id)
+        session = self._scan_sessions.get((user_id, message.guild.id))
         if not session or session.get("phase") != "confirming":
             return
         if session.get("channel_id") != message.channel.id:
@@ -2088,7 +2077,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
             await self._send_next_scan_message(session)
         else:
             await self._send_next_scan_message(session, complete=True)
-            self._finish_scan_session(user_id)
+            self._finish_scan_session(user_id, message.guild.id)
 
     async def _send_next_scan_message(
         self, session: Dict[str, Any], *, complete: bool = False
@@ -2138,12 +2127,22 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
             guide = await channel.fetch_message(session["guide_message_id"])
             await guide.edit(content=content)
         except discord.HTTPException:
-            self._finish_scan_session(session["user_id"])
+            self._finish_scan_session(session["user_id"], session["guild_id"])
 
-    def _finish_scan_session(self, user_id: int) -> None:
-        session = self._scan_sessions.pop(user_id, None)
+    def _finish_scan_session(self, user_id: int, guild_id: int) -> None:
+        session = self._scan_sessions.pop((user_id, guild_id), None)
         if session:
             self._scan_list_owners.pop(session.get("list_message_id"), None)
+
+    def _finish_all_scan_sessions_for_user(self, user_id: int) -> None:
+        """Like _finish_scan_session, but every guild at once.
+
+        For `wgtrack disable`/`wgtrack clear`, which mean to wipe this
+        user's state everywhere, not just in the guild the command happened
+        to be run from (that command may even come from a DM).
+        """
+        for key in [k for k in self._scan_sessions if k[0] == user_id]:
+            self._finish_scan_session(*key)
 
     # ---------------------------- WL learn session ----------------------------
 
@@ -2184,8 +2183,10 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
                               str(int((self._char_index[c] or {}).get("series_id") or 0)) == filter_series_id])
         already = total_catalog - len(remaining)
 
+        guild_id = ctx.guild.id
         session: Dict[str, Any] = {
             "user_id": user_id,
+            "guild_id": guild_id,
             "channel_id": ctx.channel.id,
             "filter_series_id": filter_series_id,
             "queue": [(cid, name) for cid, name in remaining],
@@ -2194,7 +2195,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
             "created": time.monotonic(),
             "guide_message_id": None,
         }
-        self._active_wl_sessions[user_id] = session
+        self._active_wl_sessions[(user_id, guild_id)] = session
 
         if filter_series_id is not None:
             series_name = self._series_index.get(filter_series_id, f"Series {filter_series_id}")
@@ -2230,19 +2231,19 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
             series_label = f"({cid})"
         return f"-# {percent}%・{current}/{total}・{name}・{series_label}\n`.i {cid}`"
 
-    async def _wl_advance(self, user_id: int, *, learned: bool, waifu_id: Optional[str] = None) -> None:
-        """Advance the WL session for user_id after one .i result arrives.
+    async def _wl_advance(self, key: Tuple[int, int], *, learned: bool, waifu_id: Optional[str] = None) -> None:
+        """Advance the WL session for (user_id, guild_id) after one .i result arrives.
 
         learned=True  → the embed was captured and Wishlist stored.
         learned=False → Waifugami returned "Something went wrong" (catalog gap
                         we queued because _char_index had it, but Waifugami
                         disagrees; skip silently).
         """
-        session = self._active_wl_sessions.get(user_id)
+        session = self._active_wl_sessions.get(key)
         if not session:
             return
         if time.monotonic() - session["created"] > WL_SESSION_TTL:
-            self._active_wl_sessions.pop(user_id, None)
+            self._active_wl_sessions.pop(key, None)
             return
 
         queue = session["queue"]
@@ -2259,13 +2260,13 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
 
         channel = self.bot.get_channel(session["channel_id"])
         if channel is None:
-            self._active_wl_sessions.pop(user_id, None)
+            self._active_wl_sessions.pop(key, None)
             return
 
         if not queue:
             # Session complete
             total = session["total"]
-            self._active_wl_sessions.pop(user_id, None)
+            self._active_wl_sessions.pop(key, None)
             try:
                 await channel.send(
                     f"✅ **Wishlist learning complete!** Processed {total} characters."
@@ -2278,10 +2279,16 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         try:
             await channel.send(self._wl_next_prompt(session))
         except discord.HTTPException:
-            self._active_wl_sessions.pop(user_id, None)
+            self._active_wl_sessions.pop(key, None)
 
-    def _finish_wl_session(self, user_id: int) -> None:
-        self._active_wl_sessions.pop(user_id, None)
+    def _finish_wl_session(self, user_id: int, guild_id: int) -> None:
+        self._active_wl_sessions.pop((user_id, guild_id), None)
+
+    def _finish_all_wl_sessions_for_user(self, user_id: int) -> None:
+        """Like _finish_wl_session, but every guild at once (see
+        _finish_all_scan_sessions_for_user — same reasoning)."""
+        for key in [k for k in self._active_wl_sessions if k[0] == user_id]:
+            self._active_wl_sessions.pop(key, None)
 
     @staticmethod
     def _quest_pressure(quest: Dict[str, Any]) -> Dict[str, Any]:
@@ -2588,6 +2595,13 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
     @card_tracking_group.command(name="enable")
     async def wgtrack_enable(self, ctx: commands.Context) -> None:
         await self.config.user(ctx.author).enabled.set(True)
+        now = time.monotonic()
+        # Prune stale flags opportunistically (someone who enabled tracking
+        # and never ran `.l` at all) rather than leaking one entry forever.
+        stale = [uid for uid, ts in self._pending_first_scan_nudge.items() if now - ts > ONBOARDING_NUDGE_TTL]
+        for uid in stale:
+            self._pending_first_scan_nudge.pop(uid, None)
+        self._pending_first_scan_nudge[ctx.author.id] = now
         await ctx.send("Now run `.l -orderby skill`")
 
     @card_tracking_group.command(name="disable")
@@ -2601,7 +2615,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         self._cancel_reminder_task("adventure", ctx.author.id)
         for kind in ("daily", "dailygacha"):
             self._cancel_reminder_task(kind, ctx.author.id)
-        self._finish_scan_session(ctx.author.id)
+        self._finish_all_scan_sessions_for_user(ctx.author.id)
         self._clear_adventure_queues(ctx.author.id)
         await ctx.send("Waifugami tracking disabled. Your stored data was kept and pending reminders were cancelled.")
 
@@ -2613,7 +2627,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         self._cancel_reminder_task("adventure", ctx.author.id)
         for kind in ("daily", "dailygacha"):
             self._cancel_reminder_task(kind, ctx.author.id)
-        self._finish_scan_session(ctx.author.id)
+        self._finish_all_scan_sessions_for_user(ctx.author.id)
         self._clear_adventure_queues(ctx.author.id)
         path = self._adventure_file(ctx.author.id)
         try:
@@ -3827,8 +3841,32 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
 
     @staticmethod
     def _parse_completion_ids(embed: discord.Embed) -> List[str]:
+        ids, _unparsed = Waifugami._parse_completion_page(embed)
+        return ids
+
+    @staticmethod
+    def _parse_completion_page(embed: discord.Embed) -> Tuple[List[str], int]:
+        """Parse one page of a `.completion` embed.
+
+        Returns ``(ids, unparsed_line_count)``. ``unparsed_line_count`` is
+        the number of non-blank lines that weren't the page-hint line and
+        didn't match ``LINE_ID_NAME_RE``.
+
+        This split exists because a zero-``ids`` page is ambiguous on its
+        own: it's the correct, expected result for a genuinely completed
+        series (an empty page body), but it's ALSO exactly what you get if
+        Waifugami tweaks the line layout and the regex stops matching
+        rows that are actually there. Those two cases render identically
+        as "0 ids" unless something also checks whether the page body had
+        content we failed to recognize. A caller that trusts "0 ids across
+        every page" as proof a series is complete — without this check —
+        would silently wipe real tracked/missing data the first time the
+        embed format drifts. See ``_scan_completion_message``'s ``suspicious``
+        tracking for where this actually gets used to withhold that trust.
+        """
         desc = embed.description or ""
         ids: List[str] = []
+        unparsed = 0
         for line in desc.splitlines():
             line = line.strip()
             if not line:
@@ -3838,22 +3876,44 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
             m = LINE_ID_NAME_RE.match(line)
             if m:
                 ids.append(str(int(m.group(1))))
-        return ids
+            else:
+                unparsed += 1
+        return ids, unparsed
 
     @staticmethod
     def _parse_info_embed(embed: discord.Embed) -> Optional[Tuple[str, str, Optional[int]]]:
         """Parse a Waifugami `.i <id>` character-info embed.
 
-        Returns ``(waifu_id, name, wishlist_value)`` if the embed's title
-        matches the `.i` shape (``"(2734) Eizen"``), or ``None`` if it
-        doesn't look like one at all. ``wishlist_value`` is ``None`` when
-        the embed doesn't have a usable ``Wishlist`` field, in which case
-        the title still matched (so it IS an `.i` embed), there's just
-        nothing new to learn from it.
+        Returns ``(waifu_id, name, wishlist_value)`` if the embed is a real
+        `.i` character-info embed, or ``None`` if it isn't.
+
+        The title shape alone — ``"(2734) Eizen"`` — is NOT enough to tell
+        this apart from a `.sc <series id>` series-roster embed: both have
+        a title of the form ``"(<id>) <name>"`` (e.g. `.i 5897` titles
+        itself "(5897) Rumi"; `.sc 548` titles itself "(548) Blue Archive").
+        Matching on title alone caused every `.sc` run to be misread as a
+        `.i` embed with "no usable Wishlist field", spamming the debug log.
+
+        The two are only reliably distinguished by shape, not title:
+        a `.i` embed carries no ``description`` and instead has
+        Wishlist/Likes/Series fields (with a "Page: N" footer); a `.sc`
+        embed carries a multi-line ``id | name`` roster in ``description``
+        and has no fields at all. We require the field-based shape before
+        treating anything as a `.i` embed.
+
+        ``wishlist_value`` is ``None`` when the embed IS a genuine `.i`
+        embed but just doesn't have a usable ``Wishlist`` field value —
+        that's the one case still worth a debug log entry.
         """
         m = INFO_EMBED_TITLE_RE.match((embed.title or "").strip())
         if not m:
             return None
+        if (embed.description or "").strip():
+            return None  # `.sc` series-roster embeds use description, `.i` never does
+        field_names = {(field.name or "").strip().casefold() for field in embed.fields}
+        if not field_names & {"wishlist", "likes", "series"}:
+            return None  # no character-info fields at all -> not a `.i` embed
+
         waifu_id = str(int(m.group(1)))
         name = m.group(2).strip()
 
@@ -4120,6 +4180,46 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         except Exception:
             return self.DEFAULT_EVENT_ROLE_ID
 
+    async def _wgupdate_send(self, channel: Any, content: str) -> Optional[Tuple[int, int]]:
+        """Send a `wgupdate` status container (A1/A2 shape). Returns
+        (channel_id, message_id) instead of a discord.Message, because V2
+        messages can't be edited through the normal `.edit(content=...)`
+        path — editing one means PATCHing its `components`, not its
+        (nonexistent) `content`. See _wgupdate_edit."""
+        payload = {
+            "flags": V2_FLAG,
+            "allowed_mentions": {"parse": []},
+            "components": [{"type": 17, "components": [{"type": 10, "content": content}]}],
+        }
+        route = Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+        try:
+            resp = await self.bot.http.request(route, json=payload)
+            return channel.id, int(resp["id"])
+        except Exception:
+            log.exception("wgupdate: failed to send status message")
+            return None
+
+    async def _wgupdate_edit(
+        self, loc: Optional[Tuple[int, int]], channel: Any, content: str
+    ) -> Optional[Tuple[int, int]]:
+        if loc is None:
+            return await self._wgupdate_send(channel, content)
+        channel_id, message_id = loc
+        payload = {
+            "allowed_mentions": {"parse": []},
+            "components": [{"type": 17, "components": [{"type": 10, "content": content}]}],
+        }
+        route = Route(
+            "PATCH", "/channels/{channel_id}/messages/{message_id}",
+            channel_id=channel_id, message_id=message_id,
+        )
+        try:
+            await self.bot.http.request(route, json=payload)
+            return loc
+        except Exception:
+            log.exception("wgupdate: failed to edit status message, sending a new one")
+            return await self._wgupdate_send(channel, content)
+
     async def _reply_or_send(self, message: discord.Message, content: str) -> Optional[discord.Message]:
         try:
             return await message.reply(content, mention_author=False)
@@ -4202,6 +4302,37 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
     # ------------------------------------------------------------
     # Autocomplete
     # ------------------------------------------------------------
+
+    async def _resolve_series_id(self, ctx: commands.Context, series: str) -> Optional[str]:
+        """Resolve a user-supplied `series` argument to a catalog series ID.
+
+        The slash-command autocomplete always submits the numeric ID as its
+        value, so clicking a suggestion is safe. But prefix commands get no
+        autocomplete at all, and a slash-command user can still type free
+        text past the suggestions — either way, ``str(int(series))`` used
+        to run unguarded and raise a bare ``ValueError`` straight out to
+        Red's generic error handler. This replies with something useful
+        instead of crashing, and falls back to a case-insensitive name
+        lookup so typing the series name (e.g. "Blue Archive") still works.
+        """
+        text = series.strip()
+        if text.isdigit():
+            return str(int(text))
+
+        needle = text.casefold()
+        matches = [sid for sid, name in self._series_index.items() if name.casefold() == needle]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            matches = [sid for sid, name in self._series_index.items() if needle in name.casefold()]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            await ctx.reply(f"I don't recognize a series called {text!r}. Try the series ID instead.")
+            return None
+        preview = ", ".join(f"({sid}) {self._series_index[sid]}" for sid in matches[:5])
+        await ctx.reply(f"That matches more than one series — be more specific or use the ID: {preview}")
+        return None
 
     async def _ac_series(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
         cur = (current or "").strip().lower()
@@ -4365,11 +4496,14 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
         series_id = self._parse_completion_series_id(emb)
         if not series_id:
             return
-        ids = self._parse_completion_ids(emb)
+        ids, unparsed = self._parse_completion_page(emb)
         # Note: an empty `ids` list is not necessarily a parse failure — a
         # fully-completed series legitimately renders a completion page
         # with zero rows, and that's exactly the signal a sync needs to
-        # clear the last stale entries for it.
+        # clear the last stale entries for it. But a page with content we
+        # couldn't recognize (`unparsed > 0`) while still yielding zero ids
+        # is the one case that looks identical to "page is genuinely empty"
+        # and isn't — see `suspicious` below.
 
         page_i, page_max = self._parse_page_hint(emb)
         has_next = page_i is not None and page_max is not None and page_i < page_max
@@ -4386,10 +4520,23 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
                 "seen_ids": set(),
                 "seen_pages": set(),
                 "status_message": None,
+                "suspicious": False,
             }
         session["seen_ids"].update(ids)
         if page_i is not None:
             session["seen_pages"].add(page_i)
+        if not ids and unparsed:
+            # This page had lines Waifugami clearly intended us to read, but
+            # none of them matched the expected `id | name` shape — almost
+            # certainly an embed-layout change, not a genuinely empty page.
+            # Don't let a full pass built partly out of this page wipe real
+            # tracked/missing data; see the `full_pass` check below.
+            session["suspicious"] = True
+            log.warning(
+                "completion scan: page %s of series %s had %d unparsed line(s) and 0 recognized ids "
+                "(embed layout may have changed) — withholding destructive sync",
+                page_i, series_id, unparsed,
+            )
 
         if has_next:
             self._active_completion_scans[msg.id] = session
@@ -4405,10 +4552,14 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
 
         # Only treat this as the complete, authoritative missing-list for the
         # series (and thus safe to remove stale entries) if every page from
-        # 0 up to the last one was actually seen. Otherwise we don't have
-        # full visibility (e.g. the scan started mid-way through the pages),
+        # 0 up to the last one was actually seen, AND no page along the way
+        # looked unparseable (`suspicious`). Otherwise we don't have full
+        # confidence in what we read (mid-scan start, or a format change),
         # so fall back to the old, non-destructive add-only behaviour.
-        full_pass = page_max is None or session["seen_pages"] == set(range(page_max + 1))
+        full_pass = (
+            (page_max is None or session["seen_pages"] == set(range(page_max + 1)))
+            and not session.get("suspicious")
+        )
 
         if full_pass:
             added, removed, total = await self._sync_completion_tracking(
@@ -4429,7 +4580,10 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
             lines = [f"-# Stored: {after} IDs"]
             if added:
                 lines.append(f"-# Added: {added} new")
-            lines.append("-# (scan started mid-page, so nothing was removed — reply starting from page 0 for a full sync)")
+            if session.get("suspicious"):
+                lines.append("-# (a page didn't parse as expected, so nothing was removed — this is a bot bug, not your fault)")
+            else:
+                lines.append("-# (scan started mid-page, so nothing was removed — reply starting from page 0 for a full sync)")
             await self._edit_status_or_send(session, msg.channel, "\n".join(lines))
 
     # ------------------------------------------------------------
@@ -5656,208 +5810,11 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
     # ------------------------------------------------------------
     # Commands, tracking
     # ------------------------------------------------------------
+    # wgtrackid / wguntrackid / wgwatch / wgunwatch / wgtrackedids and the
+    # old embed-based wgtracked are retired in favour of /wgtracked
+    # (tracking_ui.py, TrackingUIMixin) — a single Components V2 interface
+    # covering both series- and character-level tracking, add and remove.
 
-    @commands.command()
-    async def wgtrackid(self, ctx: commands.Context, char_id: str) -> None:
-        cid = (char_id or "").strip()
-        if not cid.isdigit():
-            await ctx.reply("Give me a numeric character id, example: 40123")
-            return
-        cid = str(int(cid))
-
-        entry = self._char_index.get(cid)
-        if not isinstance(entry, dict):
-            await ctx.reply(f"I do not know character id {cid}. Is your waifu_hash_map.json up to date?")
-            return
-
-        try:
-            sid = str(int(entry.get("series_id")))
-        except Exception:
-            await ctx.reply(f"I found {cid}, but its series_id looks missing or invalid in the map.")
-            return
-
-        series_name = str(entry.get("series") or "").strip() or self._series_index.get(sid, "Unknown series")
-        char_name = str(entry.get("name") or "").strip() or f"ID {cid}"
-        before, after = await self._add_explicit_tracking(int(ctx.author.id), sid, [cid])
-        if after > before:
-            await ctx.reply(f"Now tracking {char_name} in ({sid}) {series_name}. Total tracked in this series: {after}")
-        else:
-            await ctx.reply(f"Already tracking {char_name} in ({sid}) {series_name}. Total tracked in this series: {after}")
-
-    @commands.command()
-    async def wguntrackid(self, ctx: commands.Context, char_id: str) -> None:
-        cid = (char_id or "").strip()
-        if not cid.isdigit():
-            await ctx.reply("Give me a numeric character id, example: 40123")
-            return
-        cid = str(int(cid))
-
-        entry = self._char_index.get(cid)
-        if not isinstance(entry, dict):
-            await ctx.reply(f"I do not know character id {cid}.")
-            return
-
-        try:
-            sid = str(int(entry.get("series_id")))
-        except Exception:
-            await ctx.reply("I found the id, but the map entry has no usable series_id.")
-            return
-
-        series_name = str(entry.get("series") or "").strip() or self._series_index.get(sid, "Unknown series")
-        char_name = str(entry.get("name") or "").strip() or f"ID {cid}"
-        await self._remove_explicit_tracking(int(ctx.author.id), sid, cid)
-        await ctx.reply(f"Stopped tracking {char_name} in ({sid}) {series_name}.")
-
-    @commands.hybrid_command(name="wgwatch", with_app_command=True)
-    async def wgwatch(self, ctx: commands.Context, series: str) -> None:
-        sid = str(int(series))
-        uid = int(ctx.author.id)
-        watched = await self.listener_config.user_from_id(uid).watched_series()
-        if not isinstance(watched, list):
-            watched = []
-        if sid not in watched:
-            watched.append(sid)
-            watched = sorted(set(str(int(x)) for x in watched if str(x).isdigit()), key=lambda s: int(s))
-            await self.listener_config.user_from_id(uid).watched_series.set(watched)
-
-        watchers = await self.listener_config.series_watchers_by_series()
-        if not isinstance(watchers, dict):
-            watchers = {}
-        uids = set(int(x) for x in (watchers.get(sid) or []) if isinstance(x, int) or str(x).isdigit())
-        uids.add(uid)
-        watchers[sid] = sorted(uids)
-        await self.listener_config.series_watchers_by_series.set(watchers)
-        await ctx.reply(f"Watching ({sid}) {self._series_index.get(sid, 'Unknown series')}.")
-
-    @wgwatch.app_command.autocomplete("series")
-    async def _wgwatch_ac(self, interaction: discord.Interaction, current: str):
-        return await self._ac_series(interaction, current)
-
-    @commands.hybrid_command(name="wgunwatch", with_app_command=True)
-    async def wgunwatch(self, ctx: commands.Context, series: str) -> None:
-        sid = str(int(series))
-        uid = int(ctx.author.id)
-        watched = await self.listener_config.user_from_id(uid).watched_series()
-        if not isinstance(watched, list):
-            watched = []
-        watched = [str(int(x)) for x in watched if str(x).isdigit() and str(int(x)) != sid]
-        await self.listener_config.user_from_id(uid).watched_series.set(watched)
-
-        watchers = await self.listener_config.series_watchers_by_series()
-        if not isinstance(watchers, dict):
-            watchers = {}
-        cur = [int(x) for x in (watchers.get(sid) or []) if isinstance(x, int) or str(x).isdigit()]
-        cur = [x for x in cur if x != uid]
-        if cur:
-            watchers[sid] = sorted(set(cur))
-        else:
-            watchers.pop(sid, None)
-        await self.listener_config.series_watchers_by_series.set(watchers)
-        await ctx.reply(f"Stopped watching ({sid}) {self._series_index.get(sid, 'Unknown series')}.")
-
-    @wgunwatch.app_command.autocomplete("series")
-    async def _wgunwatch_ac(self, interaction: discord.Interaction, current: str):
-        return await self._ac_series(interaction, current)
-
-    @commands.hybrid_command(name="wgtracked", with_app_command=True)
-    async def wgtracked(self, ctx: commands.Context) -> None:
-        uid = int(ctx.author.id)
-        watched = await self.listener_config.user_from_id(uid).watched_series()
-        if not isinstance(watched, list):
-            watched = []
-        watched_clean = sorted({str(int(s)) for s in watched if str(s).isdigit()}, key=lambda s: int(s))
-
-        missing = await self.listener_config.user_from_id(uid).completion_missing_by_series()
-        if not isinstance(missing, dict):
-            missing = {}
-
-        tracked_chars = await self.listener_config.user_from_id(uid).tracked_characters_by_series()
-        if not isinstance(tracked_chars, dict):
-            tracked_chars = {}
-
-        page1 = discord.Embed(title="Waifugami Tracking", color=6235533)
-        if watched_clean:
-            lines = [f"({sid}) {self._series_index.get(sid, 'Unknown')}" for sid in watched_clean]
-            page1.add_field(name="Watching series", value="\n".join(lines), inline=False)
-        else:
-            page1.add_field(name="Watching series", value="None", inline=False)
-
-        def counts_for(store: Dict[str, Any]) -> List[Tuple[str, int]]:
-            out: List[Tuple[str, int]] = []
-            for sid, ids in store.items():
-                if not str(sid).isdigit() or not isinstance(ids, list):
-                    continue
-                clean_ids = {str(int(x)) for x in ids if str(x).isdigit()}
-                if clean_ids:
-                    out.append((str(int(sid)), len(clean_ids)))
-            out.sort(key=lambda t: int(t[0]))
-            return out
-
-        page2 = discord.Embed(title="Waifugami Completion & Character Tracking", color=6235533)
-        completion_counts = counts_for(missing)
-        if completion_counts:
-            lines2 = [f"({sid}) {self._series_index.get(sid, 'Unknown')}: {count}" for sid, count in completion_counts]
-            page2.add_field(name="Still needed (completion)", value="\n".join(lines2), inline=False)
-        else:
-            page2.add_field(name="Still needed (completion)", value="None", inline=False)
-
-        tracked_counts = counts_for(tracked_chars)
-        if tracked_counts:
-            lines3 = [f"({sid}) {self._series_index.get(sid, 'Unknown')}: {count}" for sid, count in tracked_counts]
-            page2.add_field(name="Explicitly tracked characters", value="\n".join(lines3), inline=False)
-        else:
-            page2.add_field(name="Explicitly tracked characters", value="None", inline=False)
-
-        pages = [page1, page2]
-        for i, embed in enumerate(pages, start=1):
-            embed.set_footer(text=f"Page {i} of {len(pages)}")
-        view = WGTrackedView(invoker_user_id=uid, pages=pages)
-        await ctx.reply(embed=pages[0], view=view)
-
-    @commands.hybrid_command(name="wgtrackedids", with_app_command=True)
-    async def wgtrackedids(self, ctx: commands.Context, series: str) -> None:
-        sid = str(int(series))
-        uid = int(ctx.author.id)
-
-        missing = await self.listener_config.user_from_id(uid).completion_missing_by_series()
-        if not isinstance(missing, dict):
-            missing = {}
-        tracked_chars = await self.listener_config.user_from_id(uid).tracked_characters_by_series()
-        if not isinstance(tracked_chars, dict):
-            tracked_chars = {}
-
-        missing_ids = {str(int(x)) for x in (missing.get(sid) or []) if str(x).isdigit()}
-        tracked_ids = {str(int(x)) for x in (tracked_chars.get(sid) or []) if str(x).isdigit()}
-        all_ids = sorted(missing_ids | tracked_ids, key=lambda s: int(s))
-
-        if not all_ids:
-            await ctx.reply(f"No tracked IDs for ({sid}) {self._series_index.get(sid, 'Unknown')}.")
-            return
-
-        def label(cid: str) -> str:
-            if cid in missing_ids and cid in tracked_ids:
-                return f"{cid} — needed + tracked"
-            if cid in missing_ids:
-                return f"{cid} — needed"
-            return f"{cid} — tracked"
-
-        lines = [label(cid) for cid in all_ids]
-        pages: List[discord.Embed] = []
-        title = f"({sid}) {self._series_index.get(sid, 'Unknown')}"
-        for idx, page_chunk in enumerate(chunk(lines, 20), start=1):
-            embed = discord.Embed(
-                title=title,
-                description="\n".join(page_chunk),
-                color=6235533,
-            )
-            embed.set_footer(text=f"Page {idx} of {(len(lines) + 19) // 20}")
-            pages.append(embed)
-        view = WGTrackedView(invoker_user_id=uid, pages=pages)
-        await ctx.reply(embed=pages[0], view=view)
-
-    @wgtrackedids.app_command.autocomplete("series")
-    async def _wgtrackedids_ac(self, interaction: discord.Interaction, current: str):
-        return await self._ac_series(interaction, current)
 
     @commands.hybrid_group(name="wgtieralert", invoke_without_command=True)
     async def wgtieralert(self, ctx: commands.Context) -> None:
@@ -6009,19 +5966,19 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
                 parsed_info = self._parse_info_embed(message.embeds[0]) if message.embeds else None
                 if parsed_info:
                     learned_id = parsed_info[0]  # waifu_id str
-                    for uid, sess in list(self._active_wl_sessions.items()):
+                    for key, sess in list(self._active_wl_sessions.items()):
                         if (sess.get("channel_id") == message.channel.id
                                 and sess.get("queue")
                                 and sess["queue"][0][0] == learned_id):
-                            await self._wl_advance(uid, learned=True, waifu_id=learned_id)
+                            await self._wl_advance(key, learned=True, waifu_id=learned_id)
                             break
             elif message.content and INFO_NOT_FOUND_RE.search(message.content):
                 # Waifugami returned 'Something went wrong' (catalog gap).
                 # Advance any session waiting in this channel — the gap id is
                 # skipped rather than stalling the whole session.
-                for uid, sess in list(self._active_wl_sessions.items()):
+                for key, sess in list(self._active_wl_sessions.items()):
                     if sess.get("channel_id") == message.channel.id and sess.get("queue"):
-                        await self._wl_advance(uid, learned=False, waifu_id=sess["queue"][0][0])
+                        await self._wl_advance(key, learned=False, waifu_id=sess["queue"][0][0])
                         break
 
             spawn_channel_ids = await self._get_spawn_channel_ids()
@@ -6032,12 +5989,12 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
             return
 
         content = (message.content or "").strip().lower()
-        if content == "cancel":
-            session = self._active_wl_sessions.get(message.author.id)
+        if content == "cancel" and message.guild:
+            session = self._active_wl_sessions.get((message.author.id, message.guild.id))
             if session and session.get("channel_id") == message.channel.id:
                 done = session["done"]
                 total = session["total"]
-                self._finish_wl_session(message.author.id)
+                self._finish_wl_session(message.author.id, message.guild.id)
                 try:
                     await message.channel.send(
                         f"WL learn session cancelled. Learned {done} of {total} this session."
@@ -6189,41 +6146,26 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
                     await ctx.reply(f"Series {s!r} not found in the catalog. Try the numeric series ID instead.")
                     return
 
-        # Cancel any existing session for this user first.
-        if ctx.author.id in self._active_wl_sessions:
-            self._finish_wl_session(ctx.author.id)
+        # Cancel any existing session for this user IN THIS GUILD first —
+        # not one they may have running in another guild entirely.
+        key = (ctx.author.id, ctx.guild.id)
+        if key in self._active_wl_sessions:
+            self._finish_wl_session(*key)
 
         await self._start_wl_session(ctx, filter_series_id=filter_sid)
 
-    @wg.command(name="trackid")
-    async def wg_trackid(self, ctx: commands.Context, char_id: str) -> None:
-        """Track completion of one character id."""
-        await self.wgtrackid.callback(self, ctx, char_id)
-
-    @wg.command(name="untrackid")
-    async def wg_untrackid(self, ctx: commands.Context, char_id: str) -> None:
-        """Stop tracking one character id."""
-        await self.wguntrackid.callback(self, ctx, char_id)
-
-    @wg.command(name="watch")
-    async def wg_watch(self, ctx: commands.Context, series: str) -> None:
-        """Watch a series for new spawns."""
-        await self.wgwatch.callback(self, ctx, series)
-
-    @wg.command(name="unwatch")
-    async def wg_unwatch(self, ctx: commands.Context, series: str) -> None:
-        """Stop watching a series."""
-        await self.wgunwatch.callback(self, ctx, series)
+    # wg trackid / untrackid / watch / unwatch / trackedids are retired —
+    # see the note where the old commands used to be defined, above.
 
     @wg.command(name="tracked")
     async def wg_tracked(self, ctx: commands.Context) -> None:
-        """Show the series you watch and the characters you track."""
-        await self.wgtracked.callback(self, ctx)
+        """Show and manage your tracked characters and series."""
+        await self.wgtracked_cmd.callback(self, ctx)
 
-    @wg.command(name="trackedids")
-    async def wg_trackedids(self, ctx: commands.Context, series: str) -> None:
-        """List your tracked character ids for one series."""
-        await self.wgtrackedids.callback(self, ctx, series)
+    @wg.command(name="completion")
+    async def wg_completion(self, ctx: commands.Context) -> None:
+        """Show and manage your harvested completion (`.wgscan`) data."""
+        await self.wgcompletion_cmd.callback(self, ctx)
 
     # ---- series display toggle ----
 
@@ -6353,7 +6295,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
 
     @wg.group(name="audit", invoke_without_command=True)
     async def wg_audit(self, ctx: commands.Context) -> None:
-        """Identify and remove low-value cards.
+        """List Audit & Cleanup Engine — identify and safely remove low-value cards.
 
         Workflow:
           1. ``[p]wg audit start``       — begin session; run `.l -event all` when prompted
