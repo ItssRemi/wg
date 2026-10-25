@@ -180,14 +180,25 @@ class TrackingUIMixin:
         interaction's webhook instead of the channel.
         """
         if ctx.interaction:
-            await ctx.interaction.response.send_message(content="\u200b", ephemeral=False)
             route = Route(
-                "PATCH", "/webhooks/{application_id}/{interaction_token}/messages/@original",
-                application_id=self.bot.application_id, interaction_token=ctx.interaction.token,
+                "POST",
+                "/interactions/{interaction_id}/{interaction_token}/callback",
+                interaction_id=ctx.interaction.id,
+                interaction_token=ctx.interaction.token,
             )
-            await self.bot.http.request(route, json=payload)
+            await self.bot.http.request(
+                route,
+                json={
+                    "type": 4,
+                    "data": payload,
+                },
+            )
         else:
-            route = Route("POST", "/channels/{channel_id}/messages", channel_id=ctx.channel.id)
+            route = Route(
+                "POST",
+                "/channels/{channel_id}/messages",
+                channel_id=ctx.channel.id,
+            )
             await self.bot.http.request(route, json=payload)
 
     async def _wgtracked_payload(
