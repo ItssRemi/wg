@@ -172,33 +172,21 @@ class TrackingUIMixin:
         style (slash vs. prefix) triggered it.
 
         discord.py's interaction.response.send_message doesn't accept raw
-        Components V2 dicts, so for the slash path we ack with a minimal
-        placeholder through discord.py's own machinery (required within 3s),
-        then immediately replace it with the real payload via the
-        original-response webhook endpoint — the same two-step shape as
-        every other raw-HTTP send in this cog, just routed through the
-        interaction's webhook instead of the channel.
+        Components V2 dicts, so for the slash path this sends the V2
+        payload directly as the initial interaction callback (type 4) via
+        raw HTTP, bypassing discord.py's response machinery entirely —
+        rather than acking with a throwaway ordinary message and then
+        replacing it, which briefly creates (and flashes) a real message
+        that was never meant to be seen.
         """
         if ctx.interaction:
             route = Route(
-                "POST",
-                "/interactions/{interaction_id}/{interaction_token}/callback",
-                interaction_id=ctx.interaction.id,
-                interaction_token=ctx.interaction.token,
+                "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                interaction_id=ctx.interaction.id, interaction_token=ctx.interaction.token,
             )
-            await self.bot.http.request(
-                route,
-                json={
-                    "type": 4,
-                    "data": payload,
-                },
-            )
+            await self.bot.http.request(route, json={"type": 4, "data": payload})
         else:
-            route = Route(
-                "POST",
-                "/channels/{channel_id}/messages",
-                channel_id=ctx.channel.id,
-            )
+            route = Route("POST", "/channels/{channel_id}/messages", channel_id=ctx.channel.id)
             await self.bot.http.request(route, json=payload)
 
     async def _wgtracked_payload(
