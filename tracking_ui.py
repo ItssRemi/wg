@@ -596,6 +596,31 @@ class TrackingUIMixin:
         )
         await self.bot.http.request(route, json={"type": 7, "data": payload})
 
+    async def _edit_tracked_message(
+        self,
+        interaction: discord.Interaction,
+        channel_id: int,
+        message_id: int,
+        payload: Dict[str, Any],
+    ) -> None:
+        """Update the original /wgtracked message after a modal submission."""
+        payload = dict(payload)
+        payload.pop("flags", None)
+
+        await interaction.response.defer(ephemeral=True)
+
+        route = Route(
+            "PATCH",
+            "/channels/{channel_id}/messages/{message_id}",
+            channel_id=channel_id,
+            message_id=message_id,
+        )
+        await self.bot.http.request(route, json=payload)
+
+        await interaction.edit_original_response(
+            content="Tracking updated."
+        )
+
     async def _handle_wgtracked_interaction(
         self, interaction: discord.Interaction, owner_id: int, parts: List[str]
     ) -> None:
@@ -645,9 +670,20 @@ class TrackingUIMixin:
             return
 
     async def _show_add_modal(self, interaction: discord.Interaction, owner_id: int, category: str) -> None:
+        message = interaction.message
+        channel_id = interaction.channel_id
+
+        if message is None or channel_id is None:
+            await interaction.response.send_message(
+                "I couldn't identify the tracking message to update. Run /wgtracked again.",
+                ephemeral=True,
+            )
+            return
+
+        message_id = message.id
         if category == "series":
             modal_data = {
-                "custom_id": f"nebwg:trkmodal:{owner_id}:addseries",
+                "custom_id": f"nebwg:trkmodal:{owner_id}:addseries:{message_id}:{channel_id}",
                 "title": "Track a series",
                 "components": [{
                     "type": 1,
@@ -659,7 +695,7 @@ class TrackingUIMixin:
             }
         else:
             modal_data = {
-                "custom_id": f"nebwg:trkmodal:{owner_id}:addchar",
+                "custom_id": f"nebwg:trkmodal:{owner_id}:addchar:{message_id}:{channel_id}",
                 "title": "Track a character",
                 "components": [
                     {"type": 1, "components": [{
@@ -687,6 +723,17 @@ class TrackingUIMixin:
             await interaction.response.send_message("This form belongs to someone else.", ephemeral=True)
             return
         owner_id = int(uid_str)
+        if kind in ("addseries", "addchar"):
+            try:
+                message_id = int(parts[4])
+                channel_id = int(parts[5])
+            except (IndexError, ValueError):
+                await interaction.response.send_message(
+                    "I couldn't identify the original tracking message. "
+                    "Run /wgtracked again and retry.",
+                    ephemeral=True,
+                )
+                return
 
         # Modal-submit field values arrive as a nested action-row structure.
         fields: Dict[str, str] = {}
@@ -703,11 +750,9 @@ class TrackingUIMixin:
                 return
             await self._add_series_tracking(owner_id, sid)
             payload = await self._wgtracked_payload(owner_id, category="series", page=0, mode="view")
-            route = Route(
-                "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
-                interaction_id=interaction.id, interaction_token=interaction.token,
+            await self._edit_tracked_message(
+                interaction, channel_id, message_id, payload
             )
-            await self.bot.http.request(route, json={"type": 4, "data": payload})
             return
 
         if kind == "addchar":
@@ -735,11 +780,9 @@ class TrackingUIMixin:
                 payload = await self._wgtracked_payload(
                     owner_id, category="series", page=0, mode="view"
                 )
-                route = Route(
-                    "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
-                    interaction_id=interaction.id, interaction_token=interaction.token,
+                await self._edit_tracked_message(
+                    interaction, channel_id, message_id, payload
                 )
-                await self.bot.http.request(route, json={"type": 4, "data": payload})
                 return
 
             # Both fields: resolve the character within the specified series.
@@ -832,13 +875,11 @@ class TrackingUIMixin:
             payload = await self._wgtracked_payload(
                 owner_id, category="characters", page=0, mode="view"
             )
-            route = Route(
-                "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
-                interaction_id=interaction.id, interaction_token=interaction.token,
+            await self._edit_tracked_message(
+                interaction, channel_id, message_id, payload
             )
-            await self.bot.http.request(route, json={"type": 4, "data": payload})
             return
-        
+
     async def _handle_wgcompletion_interaction(
         self, interaction: discord.Interaction, owner_id: int, parts: List[str]
     ) -> None:
