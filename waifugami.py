@@ -26,8 +26,10 @@ from redbot.core.data_manager import cog_data_path
 
 log = logging.getLogger("red.nebula.Waifugami")
 
-from .audit import AuditMixin  # noqa: E402  (after constants are defined above)
-from .dupes import DupesMixin  # noqa: E402
+from .audit import AuditMixin      # noqa: E402  (after constants are defined above)
+from .catalog import CatalogMixin  # noqa: E402
+from .db import CardStore          # noqa: E402
+from .dupes import DupesMixin      # noqa: E402
 
 # ============================================================
 # Constants — card tracking (from WaifugamiCards)
@@ -310,7 +312,7 @@ class WGTrackedView(discord.ui.View):
         await self._edit(interaction)
 
 
-class Waifugami(AuditMixin, DupesMixin, commands.Cog):
+class Waifugami(AuditMixin, CatalogMixin, DupesMixin, commands.Cog):
     """Waifugami card tracking, team building, and spawn assistant.
 
     Run ``[p]help wg`` to see every Waifugami command in one place.
@@ -324,8 +326,8 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
       - user completion tracking, watched series, and tier alert DMs
     """
 
-    EVENT_MIN_ID = 75500
-    EVENT_MAX_ID = 77400
+    EVENT_MIN_ID = 78050
+    EVENT_MAX_ID = 79800
     EVENT_MIN_DIGITS = 5
     CACHE_CAP = 20000
 
@@ -386,6 +388,13 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         self._questboards: Dict[int, Dict[str, Any]] = {}
         self._reminder_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
         self._restore_reminders_task: Optional[asyncio.Task] = None
+        # Background card-store tasks (strong refs so they aren't GC'd mid-run)
+        self._bg_store_tasks: Set[asyncio.Task] = set()
+        # SQLite card store — replaces the Config cards / removed_cards dicts.
+        # Initialised here; DB files are created lazily on first access per user.
+        self._card_store: CardStore = CardStore(cog_data_path(self))
+        # Migration flag set: user IDs whose Config data has been imported.
+        self._db_migrated: Set[int] = set()
         # Trade-confirmation dedup (bounded, matches CACHE_CAP idiom)
         self._trade_confirmed_seen: Deque[int] = deque(maxlen=200)
         # WL learn sessions: user_id -> session dict
@@ -394,21 +403,10 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         # ---- spawn listener config & state (from WaifugamiListener) ----
         base = Path(__file__).parent
         self.base_path = base
-        self.map_path = base / "waifu_hash_map.json"
-        self.series_catalog_path = base / "series_catalog.json"
-        self.waifus_path = base / "waifus.json"
-        self.old_lookup_path = base / "waifugami_catalog_lookup.json"
-        self.event_overrides_path = base / "wgevent_overrides.json"
-
         self.image_id_re = re.compile(r"/images/(\d+)(?:/|$)")
 
-        self.new_map: Dict[str, Dict[str, Any]] = {}
-        self.old_map: Dict[str, str] = {}
-        self.series_catalog: Dict[str, Dict[str, Any]] = {}
-        self._series_index: Dict[str, str] = {}
-        self._char_index: Dict[str, Dict[str, Any]] = {}
-
-        self.event_overrides: Dict[str, Any] = {"ids": {}, "ranges": []}
+        # ---- catalog storage (CatalogMixin) ----
+        self._catalog_init()
 
         self._event_seen: Dict[int, bool] = {}
         self._announced: Dict[int, str] = {}
@@ -475,8 +473,8 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             self._restore_persistent_reminders()
         )
         # spawn listener
-        self._load_event_overrides()
-        self._load_catalogs()
+        await self._load_event_overrides()
+        await self._load_catalogs()
         self.bot.tree.add_command(self._name_context_menu, override=True)
         await self._migrate_completion_tracking_schema()
         log.info("Waifugami cog loaded (card tracking + spawn listener merged)")
@@ -537,6 +535,11 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         for task in self._reminder_tasks.values():
             task.cancel()
         self._reminder_tasks.clear()
+        # let queued card writes finish rather than dropping observed cards
+        if self._bg_store_tasks:
+            await asyncio.gather(*self._bg_store_tasks, return_exceptions=True)
+        # close SQLite connections
+        await asyncio.to_thread(self._card_store._close_all)
         # spawn listener
         self.bot.tree.remove_command("Name", type=discord.AppCommandType.message)
 
@@ -872,38 +875,103 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
     async def _tracking_enabled(self, user_id: int) -> bool:
         return await self.config.user_from_id(user_id).enabled()
 
-    async def _store_card(self, card: Dict[str, Any]) -> None:
-        owner_id = card["owner_id"]
-        if not await self._tracking_enabled(owner_id):
-            return
-        async with self._locks[owner_id]:
-            user_conf = self.config.user_from_id(owner_id)
-            acquisition = await self._pop_matching_acquisition(owner_id, card)
-            if acquisition:
-                card["acquisition"] = acquisition
-            async with user_conf.cards() as cards:
-                key = str(card["global_id"])
-                existing = cards.get(key, {})
-                history = existing.get("local_id_history", [])
-                old_local = existing.get("local_id")
-                if old_local is not None and old_local != card["local_id"]:
-                    history.append({"local_id": old_local, "ended_at": utc_now()})
-                    history = history[-20:]
-                merged = {**existing, **card, "local_id_history": history}
-                cards[key] = merged
+    async def _ensure_migrated(self, owner_id: int) -> None:
+        """One-time import of existing Config card data into SQLite.
 
-            max_local = await user_conf.collection_max_local()
-            if max_local is None or card["local_id"] > max_local:
-                await user_conf.collection_max_local.set(card["local_id"])
-        log.info(
-            "Stored Waifugami card global=%s local=%s owner=%s name=%s",
-            card["global_id"], card["local_id"], owner_id, card["name"],
-        )
+        Called lazily on the first card write for each user.  Safe to call
+        multiple times; the migration SQL uses INSERT OR IGNORE so rows are
+        never duplicated.
+        """
+        if owner_id in self._db_migrated:
+            return
+        user_conf = self.config.user_from_id(owner_id)
+        if await self._card_store.is_migrated(owner_id):
+            # Already migrated under this fix, or under the older code that
+            # never cleared the Config side afterward. Clear it now so the
+            # leftover blob stops bloating every Config read/write for this
+            # user (see catalog.py's module docstring for the matching bug
+            # on the catalog side — same shape of problem: large JSON
+            # sitting in the hot path of something that should be cheap).
+            if await user_conf.cards() or await user_conf.removed_cards():
+                await user_conf.cards.clear()
+                await user_conf.removed_cards.clear()
+                log.info("Cleared stale Config card data owner=%s (already in SQLite)", owner_id)
+            self._db_migrated.add(owner_id)
+            return
+        cards_dict = await user_conf.cards()
+        removed_dict = await user_conf.removed_cards()
+        if cards_dict or removed_dict:
+            await self._card_store.migrate_from_config(owner_id, cards_dict, removed_dict)
+            await user_conf.cards.clear()
+            await user_conf.removed_cards.clear()
+            log.info(
+                "Migrated Config card data to SQLite owner=%s active=%d removed=%d",
+                owner_id, len(cards_dict), len(removed_dict),
+            )
+        self._db_migrated.add(owner_id)
+
+    async def _store_card(self, card: Dict[str, Any]) -> None:
+        await self._store_cards([card])
+
+    async def _store_cards(self, cards_in: List[Dict[str, Any]]) -> None:
+        """Store every card from one Waifugami message into SQLite.
+
+        One upsert per owner per message regardless of how many cards are in
+        the batch — a ``.v`` of 5 cards does one round-trip, not five.
+        """
+        by_owner: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        for card in cards_in:
+            by_owner[int(card["owner_id"])].append(card)
+
+        for owner_id, batch in by_owner.items():
+            if not await self._tracking_enabled(owner_id):
+                continue
+            async with self._locks[owner_id]:
+                await self._ensure_migrated(owner_id)
+                for card in batch:
+                    acquisition = await self._pop_matching_acquisition(owner_id, card)
+                    if acquisition:
+                        card["acquisition"] = acquisition
+                await self._card_store.upsert_cards(owner_id, batch)
+                top_local = max(int(card["local_id"]) for card in batch)
+                user_conf = self.config.user_from_id(owner_id)
+                max_local = await user_conf.collection_max_local()
+                if max_local is None or top_local > max_local:
+                    await user_conf.collection_max_local.set(top_local)
+            log.info(
+                "Stored %d Waifugami card(s) owner=%s locals=%s",
+                len(batch), owner_id, [card["local_id"] for card in batch],
+            )
+
+    def _queue_store_cards(self, cards_in: List[Dict[str, Any]]) -> None:
+        """Persist cards in the background so the next guide prompt isn't
+        held up by disk/Config work. Per-owner locks keep writes ordered."""
+        task = asyncio.create_task(self._store_cards(cards_in))
+        self._bg_store_tasks.add(task)
+
+        def _done(finished: asyncio.Task) -> None:
+            self._bg_store_tasks.discard(finished)
+            if not finished.cancelled() and finished.exception() is not None:
+                log.error(
+                    "Background Waifugami card store failed",
+                    exc_info=finished.exception(),
+                )
+
+        task.add_done_callback(_done)
 
     async def _pop_matching_acquisition(
         self, owner_id: int, card: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         user_conf = self.config.user_from_id(owner_id)
+        # Cheap read first: only enter the read-modify-write block when
+        # there is actually a pending acquisition that matches this card.
+        snapshot = await user_conf.pending_acquisitions()
+        if not any(
+            item.get("name", "").casefold() == card.get("name", "").casefold()
+            and item.get("type_symbol") == card.get("type_symbol")
+            for item in snapshot or []
+        ):
+            return None
         async with user_conf.pending_acquisitions() as pending:
             candidates = [
                 (index, item)
@@ -934,35 +1002,79 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             return
         removed_local = pending.get("local_id")
         async with self._locks[user_id]:
+            await self._ensure_migrated(user_id)
             user_conf = self.config.user_from_id(user_id)
-            removed_record = None
-            async with user_conf.cards() as cards:
-                if removed_local is None:
-                    active = [c for c in cards.values() if c.get("status") == "active" and c.get("local_id") is not None]
-                    if active:
-                        removed_local = max(c["local_id"] for c in active)
-                for key, card in list(cards.items()):
-                    local_id = card.get("local_id")
-                    if local_id == removed_local and card.get("status") == "active":
-                        removed_record = dict(card)
-                        removed_record.update({"removed_at": utc_now(), "removal_source": pending["command"]})
-                        card["status"] = "removed"
-                        card["local_id"] = None
-                        card["removed_at"] = removed_record["removed_at"]
-                    elif removed_local is not None and local_id is not None and local_id > removed_local:
-                        card.setdefault("local_id_history", []).append({"local_id": local_id, "ended_at": utc_now()})
-                        card["local_id"] = local_id - 1
-                        card["local_id_source"] = "calculated_removal"
 
-            if removed_record:
-                async with user_conf.removed_cards() as removed:
-                    removed[str(removed_record["global_id"])] = removed_record
+            if removed_local is None:
+                # .rml — remove the card with the highest local_id.
+                removed_local = await self._card_store.max_active_local_id(user_id)
+                if removed_local is None:
+                    await user_conf.collection_state.set("uncertain")
+                    return
+
+            now = utc_now()
+            removed_record = await self._card_store.mark_removed(
+                user_id, removed_local, pending.get("command", "rm"), now
+            )
+            await self._card_store.shift_local_ids_above(user_id, removed_local, delta=-1)
+
             max_local = await user_conf.collection_max_local()
             if max_local is not None:
                 await user_conf.collection_max_local.set(max(-1, max_local - 1))
             if removed_local is None:
                 await user_conf.collection_state.set("uncertain")
-        log.info("Applied Waifugami removal owner=%s local=%s", user_id, removed_local)
+        log.info("Applied Waifugami removal owner=%s local=%s found=%s",
+                 user_id, removed_local, removed_record is not None)
+
+    async def _apply_removal_batch(self, pending: Dict[str, Any]) -> None:
+        """Apply a bulk `.rm id1 id2 ... idN` via SQLite.
+
+        All marks are applied in descending local_id order inside a single
+        SQLite transaction; the shift pass is also a single UPDATE statement
+        per removed ID inside one transaction.
+        """
+        user_id = pending["user_id"]
+        if not await self._tracking_enabled(user_id):
+            return
+
+        local_ids: List[int] = sorted(
+            (lid for lid in pending.get("local_ids", []) if lid is not None),
+            reverse=True,
+        )
+        if not local_ids:
+            await self._apply_removal(pending)
+            return
+
+        command = pending.get("command", "rm")
+        now = utc_now()
+        matched = 0
+
+        async with self._locks[user_id]:
+            await self._ensure_migrated(user_id)
+            for target_local in local_ids:
+                result = await self._card_store.mark_removed(
+                    user_id, target_local, command, now
+                )
+                if result:
+                    matched += 1
+                else:
+                    log.warning(
+                        "Bulk removal: no active card at local_id=%s owner=%s",
+                        target_local, user_id,
+                    )
+            await self._card_store.shift_local_ids_above_batch(user_id, local_ids)
+
+            user_conf = self.config.user_from_id(user_id)
+            max_local = await user_conf.collection_max_local()
+            if max_local is not None:
+                await user_conf.collection_max_local.set(
+                    max(-1, max_local - len(local_ids))
+                )
+
+        log.info(
+            "Applied Waifugami bulk removal owner=%s locals=%s matched=%d",
+            user_id, local_ids, matched,
+        )
 
     # ---------------------------- Trades ----------------------------
 
@@ -1012,15 +1124,11 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             return
         if not await self._tracking_enabled(user_id):
             return
+        await self._ensure_migrated(user_id)
         user_conf = self.config.user_from_id(user_id)
         for item in sorted(items, key=lambda e: e["local_id"], reverse=True):
             local_id = item["local_id"]
-            cards = await user_conf.cards()
-            match = next(
-                (c for c in cards.values()
-                 if c.get("local_id") == local_id and c.get("status") == "active"),
-                None,
-            )
+            match = await self._card_store.get_card_by_local_id(user_id, local_id)
             if match is None:
                 log.warning(
                     "Trade removal skipped: owner=%s local_id=%s no matching active card",
@@ -1308,15 +1416,9 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             return
 
         user_conf = self.config.user_from_id(pending["user_id"])
-        cards = await user_conf.cards()
-        card = next(
-            (
-                item for item in cards.values()
-                if item.get("status") == "active"
-                and item.get("local_id") is not None
-                and int(item.get("local_id")) == pending["local_id"]
-            ),
-            None,
+        await self._ensure_migrated(pending["user_id"])
+        card = await self._card_store.get_card_by_local_id(
+            pending["user_id"], pending["local_id"]
         )
         async with self._locks[pending["user_id"]]:
             async with user_conf.teams() as teams:
@@ -1352,15 +1454,10 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
                 })
                 known_cards = []
                 for stored_slot in team["positions"]:
-                    stored = next(
-                        (
-                            item for item in cards.values()
-                            if item.get("status") == "active"
-                            and item.get("local_id") is not None
-                            and stored_slot.get("local_id") is not None
-                            and int(item.get("local_id")) == int(stored_slot.get("local_id"))
-                        ),
-                        None,
+                    if stored_slot.get("local_id") is None:
+                        continue
+                    stored = await self._card_store.get_card_by_local_id(
+                        pending["user_id"], int(stored_slot["local_id"])
                     )
                     if stored:
                         known_cards.append(stored)
@@ -1576,15 +1673,17 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
                     "message_id": message.id,
                     "observed_at": card["last_seen"],
                 }
-                await self._store_card(card)
 
             team = self._parse_team_embed(embed)
             if team:
                 await self._bind_team_preview(message, team)
 
         if observed_cards:
+            # Guide prompts only need the in-memory session, so answer first;
+            # storage (the slow part) runs in the background afterwards.
             await self._confirm_scan_batch(message, observed_cards)
             await self._dupes_on_cards(message, observed_cards)
+            self._queue_store_cards(observed_cards)
 
         acquisition = self._parse_acquisition(message.content or "")
         if acquisition:
@@ -1659,11 +1758,13 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             while len(queue) > 10:
                 queue.popleft()
             return
-        match = re.fullmatch(r"\.rm\s+(\d+)", content, re.I)
-        if match and await self._tracking_enabled(message.author.id):
+        rm_match = re.fullmatch(r"\.rm\s+((?:\d+\s*){1,20})", content, re.I)
+        if rm_match and await self._tracking_enabled(message.author.id):
+            local_ids = [int(v) for v in rm_match.group(1).split()]
             self._pending_removals[message.channel.id].append({
                 "user_id": message.author.id,
-                "local_id": int(match.group(1)),
+                "local_ids": local_ids,          # all IDs in this batch
+                "local_id": local_ids[0] if len(local_ids) == 1 else None,  # legacy compat
                 "command": "rm",
                 "created": time.monotonic(),
             })
@@ -1683,6 +1784,14 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         if not queue:
             return
         pending = queue.popleft()
+
+        # Flush any in-flight background card-store tasks before saving the team.
+        # Without this, cards from .v commands that immediately preceded .team may
+        # not yet be committed to SQLite, causing _resolve_team to report them as
+        # missing when the user reacts with the analyse emoji right after .team.
+        if self._bg_store_tasks:
+            await asyncio.gather(*list(self._bg_store_tasks), return_exceptions=True)
+
         team.update({
             "team_id": pending["team_id"],
             "user_id": pending["user_id"],
@@ -1734,11 +1843,34 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             title = after.embeds[0].title or ""
             if title.casefold() == "character successfully removed!":
                 pending = self._removal_prompts.pop(after.id)
-                await self._apply_removal(pending)
+                local_ids = pending.get("local_ids", [])
+                if len(local_ids) > 1:
+                    await self._apply_removal_batch(pending)
+                else:
+                    await self._apply_removal(pending)
             elif "cancel" in title.casefold():
                 self._removal_prompts.pop(after.id, None)
 
         await self._handle_trade_confirmed(before, after)
+
+        # ---- fallback card store: pick up card data from edited .v embeds ----
+        # Waifugami edits the .v response message after posting it (lazy image load).
+        # The initial on_message already stores the card data, so this is a safety
+        # net for cases where that event was dropped or arrived out of order.
+        # _parse_card_embed is idempotent via upsert, so double-storing is harmless.
+        observed_cards: List[Dict[str, Any]] = []
+        for embed in after.embeds:
+            card = self._parse_card_embed(embed)
+            if card:
+                observed_cards.append(card)
+                card["observation"] = {
+                    "guild_id": after.guild.id if after.guild else None,
+                    "channel_id": after.channel.id,
+                    "message_id": after.id,
+                    "observed_at": card["last_seen"],
+                }
+        if observed_cards:
+            self._queue_store_cards(observed_cards)
 
     # ---------------------------- Guided list scanning ----------------------------
 
@@ -1795,9 +1927,8 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         if not entries:
             return []
 
-        user_conf = self.config.user_from_id(user_id)
-        cards = await user_conf.cards()
-        removed = await user_conf.removed_cards()
+        await self._ensure_migrated(user_id)
+        all_cards = await self._card_store.get_all_cards(user_id)
 
         def identity_from_card(card: Dict[str, Any]) -> Optional[str]:
             name = str(card.get("name") or "").strip().casefold()
@@ -1810,7 +1941,7 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
 
         known_identities = {
             identity
-            for card in list(cards.values()) + list(removed.values())
+            for card in all_cards.values()
             for identity in [identity_from_card(card)]
             if identity
         }
@@ -2174,11 +2305,15 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         rank_order = ("F", "E", "C", "B", "A", "S", "SS", "EX", "LEGENDARY", "100DAYS")
         rank_index = rank_order.index(rank) if rank in rank_order else 0
         key = self._element_key(card)
-        score = float(card.get("skill") or 0)
+        # Level scales damage multiplicatively in-game: Total DMG * (1 + 0.005 * level).
+        # Apply the same multiplier to skill so a level-100 card scores 50% higher than
+        # an identical level-1 card, rather than the old flat +1.5 that barely mattered.
+        level = min(int(card.get("level") or 0), 100)
+        level_multiplier = 1.0 + 0.005 * level
+        score = float(card.get("skill") or 0) * level_multiplier
         score += int(card.get("luck") or 0) * (0.65 + rank_index * 0.06)
         score += float(card.get("phr") or 0) * physical_ratio * 0.08
         score += float(card.get("mgr") or 0) * magical_ratio * 0.08
-        score += min(int(card.get("level") or 0), 100) * 0.015
         if pressure["control"]:
             if key == "pure:high_brightness":
                 score += 5.0
@@ -2256,7 +2391,7 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             pool.sort(
                 key=lambda card: (
                     -self._quest_card_score(card, pressure, rank),
-                    -float(card.get("skill") or 0),
+                    -(float(card.get("skill") or 0) * (1.0 + 0.005 * min(int(card.get("level") or 0), 100))),
                     -int(card.get("luck") or 0),
                 )
             )
@@ -2330,21 +2465,58 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         reasons.append("Pure ⚡ utility is counted once because extra-turn support does not stack.")
         sections.append("### Why This Build\n" + "\n".join(f"- {reason}" for reason in reasons))
 
-        current_ids = {
-            int(slot["position"]): int(slot["card"]["global_id"])
-            for slot in positions if slot.get("card") and slot["card"].get("global_id") is not None
+        # Compare the recommendation against the team's existing slots.
+        current_slots = {
+            int(slot["position"]): slot
+            for slot in positions
+            if slot.get("position") is not None
         }
-        changes = [
-            f"`.teamadd {card.get('local_id')} {target_team_id} {position}`"
-            for position, card in assignment
-            if card.get("global_id") is None or current_ids.get(position) != int(card.get("global_id"))
-        ]
+
+        changes = []
+
+        for position, card in assignment:
+            current = current_slots.get(int(position), {})
+            current_card = current.get("card") or {}
+
+            current_local_id = (
+                current.get("local_id")
+                or current_card.get("local_id")
+            )
+            recommended_local_id = card.get("local_id")
+
+            # Skip if the same local card is already in this position.
+            if (
+                current_local_id is not None
+                and recommended_local_id is not None
+                and int(current_local_id) == int(recommended_local_id)
+            ):
+                continue
+
+            current_global_id = current_card.get("global_id")
+            recommended_global_id = card.get("global_id")
+
+            # Also compare global IDs when both are available.
+            if (
+                current_global_id is not None
+                and recommended_global_id is not None
+                and int(current_global_id) == int(recommended_global_id)
+            ):
+                continue
+
+            changes.append(
+                f"`.teamadd {recommended_local_id} "
+                f"{target_team_id} {position}`"
+            )
+
         if changes:
             sections.append(
-                f"### Changes For Team {target_team_id}\n" + "\n".join(f"> {change}" for change in changes)
+                f"### Changes For Team {target_team_id}\n"
+                + "\n".join(f"> {change}" for change in changes)
             )
         else:
-            sections.append(f"### Team {target_team_id} already matches this recommendation.")
+            sections.append(
+                f"### Team {target_team_id} already matches this recommendation."
+            )
 
         history = await self._quest_history_summary(user_id, quest)
         if history:
@@ -2408,8 +2580,9 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         """Configure Waifugami card tracking."""
         if ctx.invoked_subcommand is None:
             enabled = await self.config.user(ctx.author).enabled()
-            cards = await self.config.user(ctx.author).cards()
-            active = sum(1 for card in cards.values() if card.get("status") == "active")
+            await self._ensure_migrated(ctx.author.id)
+            cards = await self._card_store.get_cards(ctx.author.id)
+            active = len(cards)
             await ctx.send(f"Waifugami tracking is **{'enabled' if enabled else 'disabled'}**. I have {active:,} active cards stored.")
 
     @card_tracking_group.command(name="enable")
@@ -2655,19 +2828,56 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         a, b = Counter(left), Counter(right)
         return sum((a - b).values()) + sum((b - a).values())
 
-    async def _resolve_team(self, user_id: int, team: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[int]]:
-        cards = await self._active_cards(user_id)
-        by_local = {card.get("local_id"): card for card in cards}
-        resolved, missing = [], []
+    async def _resolve_team(
+        self, user_id: int, team: Dict[str, Any]
+    ) -> Tuple[List[Dict[str, Any]], List[int]]:
+        await self._ensure_migrated(user_id)
+        resolved: List[Dict[str, Any]] = []
+        missing: List[int] = []
+
         for slot in team.get("positions", []):
             item = dict(slot)
-            if not item.get("empty"):
-                card = by_local.get(item.get("local_id"))
-                if card:
-                    item["card"] = card
-                else:
-                    missing.append(int(item["local_id"]))
+
+            if item.get("empty"):
+                resolved.append(item)
+                continue
+
+            raw_local_id = item.get("local_id")
+            local_id = None
+
+            try:
+                if raw_local_id is not None:
+                    local_id = int(raw_local_id)
+                    item["local_id"] = local_id
+            except (TypeError, ValueError):
+                log.warning(
+                    "_resolve_team: invalid local_id %r for user %s",
+                    raw_local_id,
+                    user_id,
+                )
+
+            card = None
+            if local_id is not None:
+                try:
+                    card = await self._card_store.get_card_by_local_id(
+                        user_id, local_id
+                    )
+                except Exception:
+                    log.exception(
+                        "_resolve_team: card lookup failed for local_id %s, user %s",
+                        local_id,
+                        user_id,
+                    )
+
+            if card:
+                item["card"] = card
+            else:
+                item.pop("card", None)
+                if local_id is not None:
+                    missing.append(local_id)
+
             resolved.append(item)
+
         return resolved, missing
 
     async def _team_analysis_components(
@@ -2750,7 +2960,7 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             pools[self._composition_key(self._element_key(card))].append(card)
         for pool in pools.values():
             pool.sort(key=lambda card: (
-                -float(card.get("skill") or 0),
+                -(float(card.get("skill") or 0) * (1.0 + 0.005 * min(int(card.get("level") or 0), 100))),
                 -int(card.get("luck") or 0),
                 int(card.get("local_id") or 0),
             ))
@@ -2856,22 +3066,64 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
 
     @staticmethod
     def _assign_recommended_cards(
-        positions: List[Dict[str, Any]], chosen: List[Dict[str, Any]]
+        positions: List[Dict[str, Any]],
+        chosen: List[Dict[str, Any]],
     ) -> List[Tuple[int, Dict[str, Any]]]:
         """Keep selected current cards in place where possible."""
-        current = {int(slot["position"]): slot.get("card") for slot in positions}
-        best: Optional[Tuple[int, Tuple[int, ...], List[Tuple[int, Dict[str, Any]]]]] = None
+
+        current = {
+            int(slot["position"]): slot
+            for slot in positions
+            if slot.get("position") is not None
+        }
+
+        best: Optional[
+            Tuple[int, Tuple[int, ...], List[Tuple[int, Dict[str, Any]]]]
+        ] = None
+
         for permutation in itertools.permutations(chosen):
-            assignment = [(position, permutation[position - 1]) for position in range(1, 5)]
-            changes = sum(
-                1 for position, card in assignment
-                if not current.get(position)
-                or current[position].get("global_id") != card.get("global_id")
+            assignment = [
+                (position, permutation[position - 1])
+                for position in range(1, 5)
+            ]
+
+            changes = 0
+
+            for position, card in assignment:
+                slot = current.get(position, {})
+                current_card = slot.get("card") or {}
+
+                current_local_id = slot.get("local_id")
+                recommended_local_id = card.get("local_id")
+
+                same_card = (
+                    current_local_id is not None
+                    and recommended_local_id is not None
+                    and int(current_local_id) == int(recommended_local_id)
+                )
+
+                if not same_card:
+                    current_global_id = current_card.get("global_id")
+                    recommended_global_id = card.get("global_id")
+
+                    same_card = (
+                        current_global_id is not None
+                        and recommended_global_id is not None
+                        and int(current_global_id) == int(recommended_global_id)
+                    )
+
+                if not same_card:
+                    changes += 1
+
+            local_order = tuple(
+                int(card.get("local_id") or 0)
+                for _, card in assignment
             )
-            local_order = tuple(int(card.get("local_id") or 0) for _, card in assignment)
             candidate = (changes, local_order, assignment)
+
             if best is None or candidate[:2] < best[:2]:
                 best = candidate
+
         return best[2] if best else []
 
     @staticmethod
@@ -2995,8 +3247,9 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         elements: Optional[set[str]] = None,
         sort_by: str = "skill_luck",
     ) -> List[Dict[str, Any]]:
-        cards = await self.config.user_from_id(user_id).cards()
-        result = [card for card in cards.values() if card.get("status") == "active" and card.get("skill") is not None]
+        await self._ensure_migrated(user_id)
+        cards = await self._card_store.get_cards(user_id)
+        result = [card for card in cards.values() if card.get("skill") is not None]
         if elements:
             result = [card for card in result if self._element_key(card) in elements]
 
@@ -3264,7 +3517,8 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             if not values:
                 await interaction.response.send_message("No card was selected.", ephemeral=True)
                 return
-            cards = await self.config.user_from_id(owner_id).cards()
+            await self._ensure_migrated(owner_id)
+            cards = await self._card_store.get_cards(owner_id)
             candidate = cards.get(str(values[0]))
             active_team_id = await self.config.user_from_id(owner_id).active_team_id()
             teams = await self.config.user_from_id(owner_id).teams()
@@ -3487,219 +3741,9 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
     # ------------------------------------------------------------
 
     # ------------------------------------------------------------
-    # Catalog files
+    # Catalog files + event override files now live in catalog.py
+    # (CatalogMixin) — see that module's docstring for why.
     # ------------------------------------------------------------
-
-    def _load_json_file(self, path: Path, fallback: Any) -> Any:
-        if not path.exists():
-            return fallback
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            log.exception("Failed reading %s", path)
-            return fallback
-
-    def _write_json_file(self, path: Path, data: Any) -> None:
-        path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-
-    def _load_catalogs(self) -> None:
-        loaded_map = self._load_json_file(self.map_path, {})
-        self.new_map = loaded_map if isinstance(loaded_map, dict) else {}
-
-        loaded_old = self._load_json_file(self.old_lookup_path, {})
-        self.old_map = loaded_old if isinstance(loaded_old, dict) else {}
-
-        loaded_catalog = self._load_json_file(self.series_catalog_path, {})
-        if isinstance(loaded_catalog, dict) and loaded_catalog:
-            self.series_catalog = self._normalise_series_catalog(loaded_catalog)
-            self.new_map = self._build_hash_map_from_series_catalog(self.series_catalog)
-        else:
-            self.series_catalog = self._build_series_catalog_from_hash_map(self.new_map)
-            if self.series_catalog:
-                self._save_catalog_files()
-
-        self._rebuild_indexes()
-
-    def _normalise_series_catalog(self, data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        catalog: Dict[str, Dict[str, Any]] = {}
-        for sid_raw, entry in data.items():
-            if not isinstance(entry, dict):
-                continue
-            try:
-                sid = str(int(entry.get("series_id", sid_raw)))
-            except Exception:
-                continue
-            series_name = str(entry.get("series") or entry.get("name") or f"Series {sid}").strip()
-            chars_raw = entry.get("characters") or {}
-            if not isinstance(chars_raw, dict):
-                continue
-            chars: Dict[str, str] = {}
-            for cid_raw, name_raw in chars_raw.items():
-                try:
-                    cid = str(int(cid_raw))
-                except Exception:
-                    continue
-                name = str(name_raw or "").strip()
-                if name:
-                    chars[cid] = name
-            catalog[sid] = {
-                "series_id": int(sid),
-                "series": series_name,
-                "characters": dict(sorted(chars.items(), key=lambda t: int(t[0]))),
-                "updated_at": entry.get("updated_at"),
-                "source_message_id": entry.get("source_message_id"),
-            }
-        return catalog
-
-    def _build_series_catalog_from_hash_map(self, source: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        catalog: Dict[str, Dict[str, Any]] = {}
-        for entry in source.values():
-            if not isinstance(entry, dict):
-                continue
-            try:
-                cid = str(int(entry.get("id")))
-                sid = str(int(entry.get("series_id")))
-            except Exception:
-                continue
-            name = str(entry.get("name") or "").strip()
-            series = str(entry.get("series") or f"Series {sid}").strip()
-            if not name:
-                continue
-            target = catalog.setdefault(
-                sid,
-                {
-                    "series_id": int(sid),
-                    "series": series,
-                    "characters": {},
-                    "updated_at": None,
-                    "source_message_id": None,
-                },
-            )
-            target["characters"][cid] = name
-
-        for sid, entry in catalog.items():
-            chars = entry.get("characters") or {}
-            entry["characters"] = dict(sorted(chars.items(), key=lambda t: int(t[0])))
-        return dict(sorted(catalog.items(), key=lambda t: int(t[0])))
-
-    def _build_hash_map_from_series_catalog(self, catalog: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        out: Dict[str, Dict[str, Any]] = {}
-        for sid, entry in catalog.items():
-            try:
-                series_id = int(entry.get("series_id", sid))
-            except Exception:
-                continue
-            series_name = str(entry.get("series") or f"Series {series_id}").strip()
-            chars = entry.get("characters") or {}
-            if not isinstance(chars, dict):
-                continue
-            for cid_raw, name_raw in chars.items():
-                try:
-                    cid = int(cid_raw)
-                except Exception:
-                    continue
-                name = str(name_raw or "").strip()
-                if not name:
-                    continue
-                out[md5_hash(str(cid))] = {
-                    "id": cid,
-                    "name": name,
-                    "series_id": series_id,
-                    "series": series_name,
-                }
-        return dict(sorted(out.items(), key=lambda t: int(t[1]["id"])))
-
-    def _save_catalog_files(self) -> None:
-        self.series_catalog = dict(sorted(self.series_catalog.items(), key=lambda t: int(t[0])))
-        self.new_map = self._build_hash_map_from_series_catalog(self.series_catalog)
-
-        by_name: Dict[str, Dict[str, Any]] = {}
-        old_lookup: Dict[str, str] = {}
-        for waifu_hash, entry in self.new_map.items():
-            name = str(entry.get("name") or "").strip()
-            if not name:
-                continue
-            by_name[name] = {
-                "id": entry.get("id"),
-                "series_id": entry.get("series_id"),
-                "series": entry.get("series"),
-                "waifu_hash": waifu_hash,
-            }
-            old_lookup[waifu_hash] = name
-
-        self._write_json_file(self.series_catalog_path, self.series_catalog)
-        self._write_json_file(self.map_path, self.new_map)
-        self._write_json_file(self.waifus_path, by_name)
-        self._write_json_file(self.old_lookup_path, old_lookup)
-        self.old_map = old_lookup
-        self._rebuild_indexes()
-
-    def _rebuild_indexes(self) -> None:
-        self._series_index = {}
-        self._char_index = {}
-        for entry in self.new_map.values():
-            if not isinstance(entry, dict):
-                continue
-            try:
-                sid = str(int(entry.get("series_id")))
-                cid = str(int(entry.get("id")))
-            except Exception:
-                continue
-            series_name = str(entry.get("series") or f"Series {sid}").strip()
-            self._series_index.setdefault(sid, series_name)
-            self._char_index.setdefault(cid, entry)
-
-    def _replace_series_in_catalog(
-        self,
-        *,
-        series_id: str,
-        series_name: str,
-        characters: Dict[str, str],
-        source_message_id: int,
-    ) -> Tuple[int, int, int]:
-        old_entry = self.series_catalog.get(series_id, {})
-        old_chars_raw = old_entry.get("characters") if isinstance(old_entry, dict) else {}
-        old_chars = old_chars_raw if isinstance(old_chars_raw, dict) else {}
-
-        old_ids = set(old_chars.keys())
-        new_ids = set(characters.keys())
-        added = len(new_ids - old_ids)
-        removed = len(old_ids - new_ids)
-        modified = sum(
-            1
-            for cid in new_ids & old_ids
-            if str(old_chars.get(cid) or "").strip() != str(characters.get(cid) or "").strip()
-        )
-
-        self.series_catalog[series_id] = {
-            "series_id": int(series_id),
-            "series": series_name,
-            "characters": dict(sorted(characters.items(), key=lambda t: int(t[0]))),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "source_message_id": int(source_message_id),
-        }
-        self._save_catalog_files()
-        return added, removed, modified
-
-    # ------------------------------------------------------------
-    # Event override files
-    # ------------------------------------------------------------
-
-    def _load_event_overrides(self) -> None:
-        data = self._load_json_file(self.event_overrides_path, {"ids": {}, "ranges": []})
-        if not isinstance(data, dict):
-            data = {"ids": {}, "ranges": []}
-        if not isinstance(data.get("ids"), dict):
-            data["ids"] = {}
-        if not isinstance(data.get("ranges"), list):
-            data["ranges"] = []
-        self.event_overrides = data
-
-    def _save_event_overrides(self) -> None:
-        self._write_json_file(self.event_overrides_path, self.event_overrides)
 
     # ------------------------------------------------------------
     # General helpers
@@ -4515,7 +4559,7 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             await message.channel.send("-# No characters found.")
             return
 
-        added, removed, modified = self._replace_series_in_catalog(
+        added, removed, modified = await self._replace_series_in_catalog(
             series_id=series_id,
             series_name=series_name,
             characters=characters,
@@ -5151,7 +5195,7 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
             return
         id_str = m.group(1)
         self.event_overrides["ids"][id_str] = bool(event)
-        self._save_event_overrides()
+        await self._save_event_overrides()
         await ctx.send(f"Set id {id_str} to event={event}.")
 
     @wgevent.command(name="range")
@@ -5160,7 +5204,7 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
         if end < start:
             start, end = end, start
         self.event_overrides["ranges"].append({"start": int(start), "end": int(end), "event": bool(event)})
-        self._save_event_overrides()
+        await self._save_event_overrides()
         await ctx.send(f"Added range {start}..{end} with event={event}.")
 
     @wgevent.command(name="status")
@@ -6309,7 +6353,7 @@ class Waifugami(AuditMixin, DupesMixin, commands.Cog):
 
     @wg.group(name="audit", invoke_without_command=True)
     async def wg_audit(self, ctx: commands.Context) -> None:
-        """List Audit & Cleanup Engine — identify and safely remove low-value cards.
+        """Identify and remove low-value cards.
 
         Workflow:
           1. ``[p]wg audit start``       — begin session; run `.l -event all` when prompted
