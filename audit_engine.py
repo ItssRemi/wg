@@ -69,13 +69,19 @@ HIGH_VALUE_REVIEW_RARITIES: FrozenSet[str] = frozenset({"ζ", "ε"})
 OMEGA_SYMBOLS: FrozenSet[str] = frozenset({"ω"})
 
 # Stats thresholds.
-# A card is protected by stats if Skill > threshold AND Luck > threshold.
+# A card is protected by stats if Skill >= threshold AND Luck >= threshold.
+# Luck 7 is the stated minimum worth keeping; both audit and dupes use these.
 SKILL_PROTECT_THRESHOLD = 90.0
-LUCK_PROTECT_THRESHOLD = 5
+LUCK_PROTECT_THRESHOLD = 7
+
+# Canonical aliases used by dupes.py so the two workflows share one source
+# of truth.  dupes.py imports GOOD_SKILL / GOOD_LUCK from here.
+GOOD_SKILL = SKILL_PROTECT_THRESHOLD   # >= 90.0
+GOOD_LUCK  = LUCK_PROTECT_THRESHOLD    # >= 7
 
 # Near-threshold bands: if either stat is close, REVIEW not SELL.
 SKILL_NEAR_THRESHOLD_FACTOR = 0.85   # Skill > 90 * 0.85 == > 76.5
-LUCK_NEAR_THRESHOLD = LUCK_PROTECT_THRESHOLD   # Luck >= 5
+LUCK_NEAR_THRESHOLD = LUCK_PROTECT_THRESHOLD   # Luck >= 7
 
 # Maximum cards per .rm batch (index-shift safety).
 RM_BATCH_SIZE = 20
@@ -642,7 +648,7 @@ def classify_cards(
         if skill_val is not None and luck_val is not None:
             if (
                 skill_val > SKILL_PROTECT_THRESHOLD
-                and luck_val > LUCK_PROTECT_THRESHOLD
+                and luck_val >= LUCK_PROTECT_THRESHOLD
             ):
                 if disposition is None:
                     disposition = KEEP
@@ -682,7 +688,7 @@ def classify_cards(
                 eligibility_reasons.append(ELIG_NOT_PROTECTED_SERIES)
             if skill_val is not None and skill_val <= SKILL_PROTECT_THRESHOLD:
                 eligibility_reasons.append(ELIG_LOW_SKILL)
-            if luck_val is not None and luck_val <= LUCK_PROTECT_THRESHOLD:
+            if luck_val is not None and luck_val < LUCK_PROTECT_THRESHOLD:
                 eligibility_reasons.append(ELIG_LOW_LUCK)
 
         # Safety net: disposition must always be set by this point.
