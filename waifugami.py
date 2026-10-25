@@ -222,6 +222,14 @@ SERIES_ID_IN_TITLE_RE = re.compile(r"\((\d+)\)")
 # `.i <id>` character-info embed title, e.g. "(2734) Eizen"
 INFO_EMBED_TITLE_RE = re.compile(r"^\((\d+)\)\s+(.+)$")
 PAGE_HINT_RE = re.compile(r"`?\s*Page\s+(\d+)\s*(?:of|/)\s*(\d+)\s*`?", re.IGNORECASE)
+# A `.completion` embed for a series with nothing missing renders a
+# "**Completed!**" header line above the (0 of 0) page hint instead of any
+# id|name rows. Observed directly (masterlog 2026-10-25, `.completion 387`):
+# description == "**Completed!**\n\n`Page 0 of 0`". This is a legitimate,
+# expected zero-ids page, not a parsing failure — _parse_completion_page
+# must not count it toward `unparsed`, or every fully-completed series scan
+# gets wrongly flagged `suspicious` and refused as a false "bot bug".
+COMPLETION_COMPLETE_MARKER_RE = re.compile(r"^\*\*\s*completed!?\s*\*\*$", re.IGNORECASE)
 CLAIMED_BY_RE = re.compile(r"\(Claimed by\s+<@!?(\d+)>\)", re.IGNORECASE)
 WAFU_HASH_PRIMARY_RE = re.compile(
     r"/catalog/[a-f0-9]{32}/([a-f0-9]{32})/images/",
@@ -3939,6 +3947,8 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
                 continue
             if PAGE_HINT_RE.search(line):
                 break
+            if COMPLETION_COMPLETE_MARKER_RE.match(line):
+                continue  # expected "nothing missing" banner, not a parse failure
             m = LINE_ID_NAME_RE.match(line)
             if m:
                 ids.append(str(int(m.group(1))))
