@@ -133,6 +133,17 @@ ADVENTURE_BOARD_RE = re.compile(
 ADVENTURE_REFRESH_RE = re.compile(
     r"\*\*(\d+):(\d{1,2})\*\* minutes left until next quest", re.I
 )
+# Whitespace/case-tolerant version of the one observed "no team out" string
+# (item 7, adventure-state detection): \s+ absorbs line-wrap or
+# double-space drift and re.I absorbs capitalization drift, without
+# changing what's actually being matched. This is still a single-string
+# match — there's no second observed variant to generalize from — so it
+# can still silently misfire if Waifugami reworks the sentence itself;
+# _parse_questboard logs when the embed matched ADVENTURE_BOARD_RE at all
+# but neither looked like a new quest nor had any other recognizable
+# "team is out" marker, so a genuine wording change is at least visible
+# in the logs instead of failing purely silently.
+NO_TEAMS_OUT_RE = re.compile(r"no\s+teams?\s+are\s+out\s+on\s+an\s+adventure\s+currently", re.I)
 ADVENTURE_PROFIT_RE = re.compile(
     r"Total earned profit from adventures\*\*\s*\n(\d+)", re.I
 )
@@ -687,7 +698,19 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         # advice even while a team was already out on an active quest.
         # The presence/absence of "No teams are out on an adventure
         # currently" is the reliable signal, so derive both fields from it.
-        teams_out = "No teams are out on an adventure currently" not in description
+        teams_out = not NO_TEAMS_OUT_RE.search(description)
+        if teams_out and not re.search(r"is adventuring", description, re.I):
+            # Neither the "no team out" marker nor any obvious "a team is
+            # out" phrasing matched — we're inferring teams_out=True purely
+            # by absence, which is exactly the failure mode that bit the
+            # old exact-string version. Surface it rather than let it fail
+            # silently.
+            log.warning(
+                "adventure state detection: neither the known 'no teams out' "
+                "phrase nor 'is adventuring' matched this questboard embed — "
+                "Waifugami's wording may have changed. description=%r",
+                description[:300],
+            )
         return {
             "state": "current_adventure" if teams_out else "new_quest",
             "rank": rank,
@@ -1167,7 +1190,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         except discord.HTTPException:
             log.exception("Could not add quest analysis reaction to message %s", message.id)
         try:
-            await self._send_quest_wait_button(message.channel, pending["user_id"], message.id)
+            await self._send_quest_wait_button(message.channel, pending["user_id"], message.id, quest)
         except discord.HTTPException:
             log.exception("Could not send quest wait button for message %s", message.id)
 
@@ -2745,21 +2768,64 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
 
         return responses[-1] if responses else None
 
+    @staticmethod
+    def _format_quest_duration(minutes: Optional[int]) -> str:
+        if not minutes:
+            return "?"
+        hours, mins = divmod(int(minutes), 60)
+        if hours and mins:
+            return f"{hours}h {mins}m"
+        if hours:
+            return f"{hours}h"
+        return f"{mins}m"
+
     async def _send_quest_wait_button(
-        self, channel: Any, user_id: int, board_message_id: int
+        self, channel: Any, user_id: int, board_message_id: int, quest: Optional[Dict[str, Any]] = None
     ) -> Any:
+        """Send the `.ad` compact info line + action button (A13 shape).
+
+        The button's custom_id, and the `nebwg:questwait:` handler in
+        on_interaction that owns it, are unchanged from before this
+        redesign — this only changes what gets rendered and its label.
+        Interpretation note: the brief's "Skip" button has no existing
+        dispatch-via-button counterpart to preserve (the only thing that
+        actually starts an adventure is `.sad <team>`, typed to Waifugami
+        directly — sending that as our own bot's message would almost
+        certainly be silently ignored, since bots conventionally don't
+        process commands from other bots, this cog included). So "Skip"
+        here is the existing quest-wait-reminder action, relabelled and
+        given the compact rank/duration/reward line above it; it does not
+        dispatch a team or start an adventure. See the chat writeup for
+        the full reasoning — this is a judgment call, not a verified spec.
+        """
+        documented = (quest or {}).get("documented") or {}
+        rank = str((quest or {}).get("rank") or "?")
+        minutes = documented.get("minutes")
+        dp = documented.get("dp")
+        if dp is None:
+            dp = (quest or {}).get("displayed_profit_dp")
+        duration_text = self._format_quest_duration(minutes)
+        dp_text = f"{int(dp):,} DP" if isinstance(dp, (int, float)) else "? DP"
+        info_line = f"Quest: **{rank}**・Duration: **{duration_text}**・Reward: **{dp_text}**"
+
         payload: Dict[str, Any] = {
             "flags": V2_FLAG,
             "allowed_mentions": {"parse": []},
             "components": [{
-                "type": 1,
-                "components": [{
-                    "type": 2,
-                    "style": 2,
-                    "label": "Remind in 15 min",
-                    "emoji": {"name": "🔔"},
-                    "custom_id": f"nebwg:questwait:{user_id}:{board_message_id}",
-                }],
+                "type": 17,
+                "components": [
+                    {"type": 10, "content": info_line},
+                    {
+                        "type": 1,
+                        "components": [{
+                            "type": 2,
+                            "style": 2,
+                            "label": "Skip",
+                            "emoji": {"name": "🔔"},
+                            "custom_id": f"nebwg:questwait:{user_id}:{board_message_id}",
+                        }],
+                    },
+                ],
             }],
             "message_reference": {
                 "message_id": str(board_message_id),
@@ -4642,13 +4708,13 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             await self._finish_series_update(target_message)
             return
 
-        status_message = await self._reply_or_send(
-            trigger_message,
-            f"-# Scanning: `({series_id}) {series_name}`\n-# Flip pages until complete.",
+        status_loc = await self._wgupdate_send(
+            trigger_message.channel,
+            f"-# Scanning: `({series_id}) {series_name}`\n",
         )
         state = self._active_series_updates.get(target_message.id)
         if state is not None:
-            state["status_message"] = status_message
+            state["status_message"] = status_loc
 
     async def _handle_series_update_edit(self, message: discord.Message) -> bool:
         state = self._active_series_updates.get(message.id)
@@ -4681,12 +4747,12 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             if missing:
                 if not state.get("notified_missing"):
                     state["notified_missing"] = True
-                    status_message = await self._edit_status_or_send(
-                        state,
+                    status_loc = await self._wgupdate_edit(
+                        state.get("status_message"),
                         message.channel,
                         "-# Missing pages: `" + ", ".join(str(i) for i in missing) + "`.",
                     )
-                    state["status_message"] = status_message
+                    state["status_message"] = status_loc
                 return True
             await self._finish_series_update(message)
         return True
@@ -4710,28 +4776,110 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             characters.update(page_chars)
 
         if not characters:
-            await message.channel.send("-# No characters found.")
+            # Parsed as a series-characters embed but yielded zero entries —
+            # that's an incomplete/failed result, not a legitimate
+            # zero-change update. Report it as a failure, not as "Updated"
+            # with all-zero counts, so the two are never confused.
+            await self._wgupdate_edit(
+                state.get("status_message"), message.channel,
+                f"-# Failed: `({series_id}) {series_name}`\n-# No characters were found in the scanned page(s).",
+            )
             return
 
-        added, removed, modified = await self._replace_series_in_catalog(
-            series_id=series_id,
-            series_name=series_name,
-            characters=characters,
-            source_message_id=message.id,
-        )
+        try:
+            added, removed, modified = await self._replace_series_in_catalog(
+                series_id=series_id,
+                series_name=series_name,
+                characters=characters,
+                source_message_id=message.id,
+            )
+        except Exception:
+            log.exception("wgupdate: catalog refresh failed for series %s", series_id)
+            await self._wgupdate_edit(
+                state.get("status_message"), message.channel,
+                f"-# Failed: `({series_id}) {series_name}`\n-# The catalog refresh raised an error — see logs.",
+            )
+            return
 
         content = (
             f"-# Updated: `({series_id}) {series_name}`\n"
-            f"-# Added: `{added}`\n"
-            f"-# Removed: `{removed}`\n"
-            f"-# Modified: `{modified}`"
+            f"> -# Added: `{added}`\n"
+            f"> -# Removed: `{removed}`\n"
+            f"> -# Modified: `{modified}`"
         )
-
-        await self._edit_status_or_send(state, message.channel, content)
+        await self._wgupdate_edit(state.get("status_message"), message.channel, content)
 
     # ------------------------------------------------------------
     # DM helpers
     # ------------------------------------------------------------
+
+    def _notification_v2_payload(
+        self,
+        *,
+        char_name: str,
+        series_name: str,
+        thumb_url: str,
+        jump_url: str,
+        accent_color: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Build the A4-A7 Components V2 notification shape: a container
+        with one Section (text + thumbnail accessory) and one action row
+        holding a style-5 link button.
+
+        The link button intentionally carries no custom_id — Discord
+        rejects (or silently drops) a style-5 button that has one, since a
+        link button isn't an interactive component Discord ever routes an
+        interaction for. The `p_...` custom_ids shown in the captured A3-A7
+        reference payloads are leftovers from the tool that captured them,
+        not something to reproduce.
+        """
+        section: Dict[str, Any] = {
+            "type": 9,
+            "components": [{
+                "type": 10,
+                "content": f"**{char_name}**\n-# {series_name}",
+            }],
+        }
+        if thumb_url:
+            section["accessory"] = {"type": 11, "media": {"url": thumb_url}}
+
+        container: Dict[str, Any] = {
+            "type": 17,
+            "components": [
+                section,
+                {
+                    "type": 1,
+                    "components": [{
+                        "type": 2, "style": 5, "label": "Jump", "url": jump_url,
+                    }],
+                },
+            ],
+        }
+        if accent_color is not None:
+            container["accent_color"] = int(accent_color)
+
+        return {
+            "flags": V2_FLAG,
+            "allowed_mentions": {"parse": []},
+            "components": [container],
+        }
+
+    async def _send_v2_dm(self, user_id: int, payload: Dict[str, Any]) -> bool:
+        try:
+            user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+            if not user:
+                return False
+            dm = user.dm_channel or await user.create_dm()
+        except Exception:
+            return False
+
+        route = Route("POST", "/channels/{channel_id}/messages", channel_id=dm.id)
+        try:
+            await self.bot.http.request(route, json=payload)
+            return True
+        except Exception:
+            log.info("DM send failed for uid=%s", user_id)
+            return False
 
     async def _dm_user_hit(
         self,
@@ -4742,28 +4890,13 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         thumb_url: str,
         jump_url: str,
     ) -> None:
-        try:
-            user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
-        except Exception:
-            return
-        if not user:
-            return
-
-        emb = discord.Embed(
-            description=f"**{char_name}**\n{series_name}",
-            color=14548992,
+        # Matches the legacy embed's color=14548992 (A3/A4's completion/
+        # tracked-character hit notification).
+        payload = self._notification_v2_payload(
+            char_name=char_name, series_name=series_name,
+            thumb_url=thumb_url, jump_url=jump_url, accent_color=14548992,
         )
-        if thumb_url:
-            emb.set_thumbnail(url=thumb_url)
-
-        view = discord.ui.View()
-        if jump_url:
-            view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Jump", url=jump_url))
-
-        try:
-            await user.send(embed=emb, view=view)
-        except Exception:
-            log.info("DM failed for uid=%s", user_id)
+        await self._send_v2_dm(user_id, payload)
 
     async def _dm_user_tier_alert(
         self,
@@ -4776,35 +4909,23 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         thumb_url: str,
         jump_url: str,
     ) -> None:
-        try:
-            user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
-        except Exception:
-            return
-        if not user:
-            return
-
         data = WG_TIER_ALERTS.get(tier, {})
-        label = data.get("label", f"{tier.title()} tier spawn detected")
+        # The tier's configured color is the ground truth for accent_color
+        # here (not the sample numbers in the A5-A7 reference payloads,
+        # which don't all match this dict — e.g. zeta's sample shows
+        # 16076006 where this dict has 12135852 for the same tier. Per the
+        # brief, "the intended image and accent colour for each type" means
+        # what WG_TIER_ALERTS already defines, not the capture's numbers).
         color = int(data.get("color", 14548992))
-
-        emb = discord.Embed(
-            title=label,
-            description=f"**{char_name}**\n{series_name}",
-            color=color,
+        # image_url (the tier-identifying art, e.g. a fixed GIF for "fake")
+        # takes priority over the character's own thumbnail when present,
+        # matching the old embed's set_image-over-set_thumbnail precedence.
+        media_url = image_url or thumb_url
+        payload = self._notification_v2_payload(
+            char_name=char_name, series_name=series_name,
+            thumb_url=str(media_url), jump_url=jump_url, accent_color=color,
         )
-        if thumb_url:
-            emb.set_thumbnail(url=thumb_url)
-        if image_url:
-            emb.set_image(url=image_url)
-
-        view = discord.ui.View()
-        if jump_url:
-            view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Jump", url=jump_url))
-
-        try:
-            await user.send(embed=emb, view=view)
-        except Exception:
-            log.info("Tier DM failed for uid=%s tier=%s", user_id, tier)
+        await self._send_v2_dm(user_id, payload)
 
     # ------------------------------------------------------------
     # Claim handling
@@ -5136,7 +5257,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             if not isinstance(tracked_chars, dict):
                 tracked_chars = {}
 
-            watched = await self.listener_config.user_from_id(uid).watched_series()
+            watched = await self.listener_config.user_from_id(uid).tracked_series()
             if not isinstance(watched, list):
                 watched = []
 
