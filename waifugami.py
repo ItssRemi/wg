@@ -138,6 +138,20 @@ TIER_ANCHOR_EMOJI = "🔺"
 FAV_COMMAND_BATCH_SIZE = 20
 VIEW_COMMAND_RE = re.compile(r"\.v\s+((?:\d+\s*){1,5})$", re.I)
 LIST_COMMAND_RE = re.compile(r"^\.l(?:\s|$)", re.I)
+FAVORITE_MANY_COMMAND_RE = re.compile(
+    r"^list m(?:\s+(.+))?$",
+    re.I,
+)
+
+FAV_SUBMIT_RE = re.compile(
+    r"^\.fav\s+((?:\d+\s*){1,20})\s+(\S+)\s*$",
+    re.I,
+)
+
+FAV_SUCCESS_RE = re.compile(
+    r"successfully favored\s+(.+?)\s+to the emoji\s+(.+?)\s*[.!]?$",
+    re.I,
+)
 SKILL_LIST_ENTRY_RE = re.compile(r"^(\d+)\s*\|\s*(.+?)\s*$", re.M)
 DAILY_COMMAND_RE = re.compile(r"\.daily\s*$", re.I)
 DAILYGACHA_COMMAND_RE = re.compile(r"\.dailygacha\s*$", re.I)
@@ -384,6 +398,13 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         # pop logic.
         self._scan_sessions: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self._scan_list_owners: Dict[int, Tuple[int, int]] = {}
+        self._favorite_many_sessions: Dict[
+            Tuple[int, int], Dict[str, Any]
+        ] = {}
+
+        self._favorite_many_list_owners: Dict[
+            int, Tuple[int, int]
+        ] = {}
         self._pending_ad_commands: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._pending_dispatches: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._pending_end_commands: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
@@ -1627,17 +1648,37 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             return
 
         if not message.author.bot:
-            # `list dupes` (reply to a list) and `keep <ids>`.
             if await self._dupes_on_user_message(message):
                 return
-            list_trigger = (message.content or "").strip().casefold()
+
+            content = (message.content or "").strip()
+            favorite_many_match = FAVORITE_MANY_COMMAND_RE.fullmatch(content)
+
+            if favorite_many_match:
+                emoji = favorite_many_match.group(1)
+
+                # `list m <emoji>` starts submitting the collected batches.
+                if emoji:
+                    await self._finish_favorite_many(message, emoji.strip())
+                    return
+
+                # Bare `list m` must reply to a Waifugami list embed.
+                if await self._try_list_action_from_reply(message, "list m"):
+                    return
+
+            list_trigger = content.casefold()
             if list_trigger in {"list", "list v", "list new"}:
                 if await self._try_list_action_from_reply(message, list_trigger):
                     return
+
+            await self._observe_favorite_many_submit(message)
             await self._observe_user_command(message)
             return
+
         if message.author.id != WAIFUGAMI_ID:
             return
+        
+        await self._confirm_favorite_many_batch(message)
 
         # ---- audit engine: capture first page of .l -event all ----
         if await self.audit_on_new_message(message):
@@ -1919,6 +1960,8 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
 
         if after.id in self._scan_list_owners:
             await self._collect_scan_page(after)
+        if after.id in self._favorite_many_list_owners:
+            await self._collect_favorite_many_page(after)
 
         if after.id in self._removal_prompts and after.embeds:
             title = after.embeds[0].title or ""
@@ -2119,6 +2162,9 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         if trigger == "list":
             await self._send_favorite_list(message, list_message)
             return True
+        if trigger == "list m":
+            await self._start_favorite_many_session(message, list_message)
+            return True
         if trigger == "list new":
             if not await self._tracking_enabled(message.author.id):
                 await message.reply("Run `..wgtrack enable` first.", mention_author=False)
@@ -2250,6 +2296,280 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
                 changed = True
         if changed:
             await self._render_scan_session(session)
+
+    async def _start_favorite_many_session(
+        self,
+        trigger: discord.Message,
+        list_message: discord.Message,
+    ) -> None:
+        """Collect unique IDs across flipped list pages for bulk favoriting."""
+        if not list_message.embeds:
+            return
+
+        local_ids = self._parse_skill_list(list_message.embeds[0])
+        if not local_ids:
+            await trigger.reply(
+                "I couldn't read any IDs from that list.",
+                mention_author=False,
+            )
+            return
+
+        key = (trigger.author.id, trigger.guild.id)
+        self._finish_favorite_many_session(*key)
+
+        response = await trigger.reply(
+            "Collecting list pages. Keep flipping through the list, "
+            "then send `list m <emoji>` when you're finished.",
+            mention_author=False,
+        )
+
+        unique_ids = list(dict.fromkeys(local_ids))
+        session = {
+            "user_id": trigger.author.id,
+            "guild_id": trigger.guild.id,
+            "channel_id": trigger.channel.id,
+            "list_message_id": list_message.id,
+            "guide_message_id": response.id,
+            "seen_ids": unique_ids,
+            "remaining_ids": list(unique_ids),
+            "current_batch": [],
+            "emoji": None,
+            "batch_number": 0,
+            "awaiting_batch": False,
+            "submitted_at": None,
+            "created": time.monotonic(),
+        }
+
+        self._favorite_many_sessions[key] = session
+        self._favorite_many_list_owners[list_message.id] = key
+
+    async def _collect_favorite_many_page(
+        self,
+        message: discord.Message,
+    ) -> None:
+        """Harvest IDs from each edited page of the active list."""
+        key = self._favorite_many_list_owners.get(message.id)
+        session = (
+            self._favorite_many_sessions.get(key)
+            if key is not None
+            else None
+        )
+
+        if not session or session.get("emoji") is not None:
+            return
+        if not message.embeds:
+            return
+
+        if time.monotonic() - session["created"] > SCAN_SESSION_TTL:
+            self._finish_favorite_many_session(*key)
+            return
+
+        local_ids = self._parse_skill_list(message.embeds[0])
+        if not local_ids:
+            return
+
+        changed = False
+        for local_id in local_ids:
+            if local_id not in session["seen_ids"]:
+                session["seen_ids"].append(local_id)
+                session["remaining_ids"].append(local_id)
+                changed = True
+
+        if changed:
+            try:
+                guide = await message.channel.fetch_message(
+                    session["guide_message_id"]
+                )
+                await guide.edit(
+                    content=(
+                        f"Collecting list pages: **{len(session['seen_ids'])} "
+                        f"unique IDs** collected. Keep flipping, then send "
+                        "`list m <emoji>`."
+                    )
+                )
+            except discord.HTTPException:
+                log.debug("Could not update list m progress message.")
+
+    async def _finish_favorite_many(
+        self,
+        message: discord.Message,
+        emoji: str,
+    ) -> None:
+        """Stop collection and start sending batches of favorite IDs."""
+        key = (message.author.id, message.guild.id)
+        session = self._favorite_many_sessions.get(key)
+
+        if not session or session["channel_id"] != message.channel.id:
+            await message.reply(
+                "Reply to a Waifugami list with `list m` first.",
+                mention_author=False,
+            )
+            return
+
+        if time.monotonic() - session["created"] > SCAN_SESSION_TTL:
+            self._finish_favorite_many_session(*key)
+            await message.reply(
+                "That collection session expired. Start again with `list m`.",
+                mention_author=False,
+            )
+            return
+
+        if not emoji or any(character.isspace() for character in emoji):
+            await message.reply(
+                "Provide one emoji, for example `list m 🔺`.",
+                mention_author=False,
+            )
+            return
+
+        session["emoji"] = emoji
+        session["total_ids"] = len(session["remaining_ids"])
+
+        await self._send_next_favorite_many_batch(session)
+
+    async def _send_next_favorite_many_batch(
+        self,
+        session: Dict[str, Any],
+    ) -> None:
+        """Send the next batch, never exceeding Waifugami's 20-ID limit."""
+        remaining = session["remaining_ids"]
+
+        if not remaining:
+            await self._send_channel_v2_text(
+                self.bot.get_channel(session["channel_id"]),
+                (
+                    f"Finished favoriting all **{session['total_ids']} IDs** "
+                    f"with {session['emoji']}."
+                ),
+            )
+            self._finish_favorite_many_session(
+                session["user_id"],
+                session["guild_id"],
+            )
+            return
+
+        batch = remaining[:FAV_COMMAND_BATCH_SIZE]
+        session["current_batch"] = list(batch)
+        session["batch_number"] += 1
+        session["awaiting_batch"] = False
+        session["submitted_at"] = None
+
+        total_batches = (
+            len(session["remaining_ids"]) + FAV_COMMAND_BATCH_SIZE - 1
+        ) // FAV_COMMAND_BATCH_SIZE
+
+        command = (
+            ".fav "
+            + " ".join(str(local_id) for local_id in batch)
+            + f" {session['emoji']}"
+        )
+
+        channel = self.bot.get_channel(session["channel_id"])
+        if channel is None:
+            self._finish_favorite_many_session(
+                session["user_id"],
+                session["guild_id"],
+            )
+            return
+
+        await self._send_channel_v2_text(
+            channel,
+            (
+                f"**Batch {session['batch_number']}** "
+                f"({len(batch)} IDs). Run this command and I'll send the "
+                "next batch after Waifugami confirms it:\n"
+                f"`{command}`"
+            ),
+        )
+
+    async def _observe_favorite_many_submit(
+        self,
+        message: discord.Message,
+    ) -> None:
+        """Recognize when the user submits the currently offered .fav batch."""
+        match = FAV_SUBMIT_RE.fullmatch(
+            (message.content or "").strip()
+        )
+        if not match:
+            return
+
+        key = (message.author.id, message.guild.id)
+        session = self._favorite_many_sessions.get(key)
+        if not session:
+            return
+        if session["channel_id"] != message.channel.id:
+            return
+        if session.get("emoji") is None or session.get("awaiting_batch"):
+            return
+
+        submitted_ids = [int(value) for value in match.group(1).split()]
+        submitted_emoji = match.group(2)
+
+        if submitted_ids != session["current_batch"]:
+            return
+        if submitted_emoji != session["emoji"]:
+            return
+
+        session["awaiting_batch"] = True
+        session["submitted_at"] = time.monotonic()
+
+    async def _confirm_favorite_many_batch(
+        self,
+        message: discord.Message,
+    ) -> None:
+        """Advance only when Waifugami confirms the exact submitted batch."""
+        match = FAV_SUCCESS_RE.search(message.content or "")
+        if not match or not message.guild:
+            return
+
+        confirmed_ids = [
+            int(value) for value in re.findall(r"\d+", match.group(1))
+        ]
+        confirmed_emoji = match.group(2).strip()
+
+        for key, session in list(self._favorite_many_sessions.items()):
+            if not session.get("awaiting_batch"):
+                continue
+            if session["channel_id"] != message.channel.id:
+                continue
+
+            submitted_at = session.get("submitted_at")
+            if not submitted_at or time.monotonic() - submitted_at > 60:
+                continue
+
+            if confirmed_ids != session["current_batch"]:
+                continue
+            if confirmed_emoji != session["emoji"]:
+                continue
+
+            completed_ids = set(session["current_batch"])
+            session["remaining_ids"] = [
+                local_id
+                for local_id in session["remaining_ids"]
+                if local_id not in completed_ids
+            ]
+
+            session["current_batch"] = []
+            session["awaiting_batch"] = False
+            session["submitted_at"] = None
+
+            await self._send_next_favorite_many_batch(session)
+            return
+
+    def _finish_favorite_many_session(
+        self,
+        user_id: int,
+        guild_id: int,
+    ) -> None:
+        """Remove the session and its list-message ownership mapping."""
+        key = (user_id, guild_id)
+        session = self._favorite_many_sessions.pop(key, None)
+        if session:
+            list_message_id = session.get("list_message_id")
+            if list_message_id is not None:
+                self._favorite_many_list_owners.pop(
+                    list_message_id,
+                    None,
+                )
 
     async def _lock_scan_from_view(
         self, message: discord.Message, sent_ids: List[int]
