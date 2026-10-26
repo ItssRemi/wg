@@ -110,7 +110,32 @@ WL_PAGE_SIZE = 15  # rows per page in the wishlist V2 view
 # Matches lines like "5272 | Kafka ((630) Wishlist)" from a Kazuha orderwl DM dump
 KAZUHA_ORDERWL_LINE_RE = re.compile(r"^(\d+)\s*\|\s*(.+?)\s*\(\((\d+)\)\s*Wishlist\)\s*$", re.M)
 SKILL_LIST_TITLE_RE = re.compile(r"^.+?'s Waifus \(Page (\d+)\)$", re.I)
+# Captures the possessive-owner prefix out of that same title shape — e.g.
+# "itsremi's Waifus (Page 0)" -> "itsremi". This is the Discord USERNAME
+# (confirmed directly: title "itsremi's Waifus" for the account whose
+# actual username is itsremi), not a nickname/display name, which matters
+# because usernames are globally unique per Discord account and nicknames
+# are not — see _resolve_user_by_list_title.
+LIST_TITLE_OWNER_RE = re.compile(r"^(.+?)'s Waifus \(Page \d+\)$", re.I)
 SKILL_LIST_ID_RE = re.compile(r"^(\d+)\s*\|", re.M)
+# A `.l` row is "{id} | {favorite emoji, or blank} [{type symbol}] {name}" —
+# the favorite slot is present but empty when unset (confirmed: compare
+# "3766 | 🍭 [α] Aries" against "1338 |  [β] Umi Sonoda" in an observed
+# `.l -orderby skill` page). \S* captures that slot whether populated or
+# blank; group(2) is "" rather than None when blank.
+LIST_ROW_RE = re.compile(r"^(\d+)\s*\|\s*(\S*)\s*\[([^\]]+)\]\s*(.+?)\s*$", re.M)
+# The emoji Nebula reserves exclusively for her own "adventure-worthy"
+# bookkeeping (skill/luck tier, matching audit_engine.py's GOOD_SKILL/
+# GOOD_LUCK thresholds) — `.l -favorite 🔺` gives a small, single-purpose,
+# authoritative listing of exactly these cards' CURRENT local_ids, so
+# self-correction never has to guess which card a drifted local_id used to
+# belong to. Confirmed real syntax (masterlog 2026-10-26, `.fav 2 1 470 134
+# 🔺` -> "successfully favored 2, 1, 470, 134 to the emoji 🔺"; `.l
+# -favorite 🔺` returns a normal `.l`-shaped embed filtered to those rows).
+TIER_ANCHOR_EMOJI = "🔺"
+# Discord lets a bot's command include up to this many ids per `.fav` call
+# (confirmed by the person running this bot, not guessed).
+FAV_COMMAND_BATCH_SIZE = 20
 VIEW_COMMAND_RE = re.compile(r"\.v\s+((?:\d+\s*){1,5})$", re.I)
 LIST_COMMAND_RE = re.compile(r"^\.l(?:\s|$)", re.I)
 SKILL_LIST_ENTRY_RE = re.compile(r"^(\d+)\s*\|\s*(.+?)\s*$", re.M)
@@ -369,6 +394,17 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         # an unrelated `.l` days later).
         self._pending_first_scan_nudge: Dict[int, float] = {}
         self._pending_list_commands: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
+        # Separate from _pending_list_commands above on purpose: that one is
+        # only populated for users mid-onboarding (so _maybe_send_first_scan_nudge
+        # can tell whose `.l` it's looking at). This one is populated for
+        # EVERY `.l` command from EVERY user, because `.l`-shaped embeds
+        # carry no ownership info at all (no "Claimed by" per row the way a
+        # `.v` card embed does), and the anchor-list self-correction below
+        # needs to know whose per-user SQLite DB to write into — guessing
+        # wrong here would corrupt a different user's card data. Mixing the
+        # two queues would make the onboarding nudge fire for the wrong
+        # user's `.l`, so they stay separate even though they overlap.
+        self._pending_general_list_commands: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._pending_cooldown_commands: Dict[int, Deque[Dict[str, Any]]] = defaultdict(deque)
         self._questboards: Dict[int, Dict[str, Any]] = {}
         self._reminder_tasks: Dict[Tuple[str, int], asyncio.Task] = {}
@@ -1623,6 +1659,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
 
         for embed in message.embeds:
             await self._maybe_send_first_scan_nudge(message, embed)
+            await self._refresh_local_ids_from_anchor_list(message, embed)
             quest = self._parse_questboard(embed)
             if quest:
                 await self._bind_questboard(message, quest)
@@ -1670,12 +1707,15 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
     async def _observe_user_command(self, message: discord.Message) -> None:
         content = (message.content or "").strip()
 
-        if LIST_COMMAND_RE.match(content) and message.author.id in self._pending_first_scan_nudge:
-            self._pending_list_commands[message.channel.id].append({
+        if LIST_COMMAND_RE.match(content):
+            entry = {
                 "user_id": message.author.id,
                 "message_id": message.id,
                 "created": time.monotonic(),
-            })
+            }
+            self._pending_general_list_commands[message.channel.id].append(dict(entry))
+            if message.author.id in self._pending_first_scan_nudge:
+                self._pending_list_commands[message.channel.id].append(entry)
 
         team_add_match = TEAM_ADD_RE.fullmatch(content)
         if team_add_match and await self._tracking_enabled(message.author.id):
@@ -1786,10 +1826,67 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         user_conf = self.config.user_from_id(pending["user_id"])
         async with user_conf.teams() as teams:
             teams[str(team["team_id"])] = team
+
+        # A `.team N` embed is an authoritative, free source of "name has
+        # local_id X right now" for whoever's currently on the team — but
+        # until now nothing ever fed that back into the card DB, so a
+        # card's stored local_id only ever got corrected when the user
+        # happened to look that exact card up again directly (`.v`/`.l`).
+        # In between, local_ids drift (removing any card below it in the
+        # list shifts everything above down by one), so team-build
+        # recommendations kept citing stale, sometimes now-wrong-character
+        # local_ids for team members the user hadn't personally re-looked-up
+        # recently. Correct them here, the moment we see the team.
+        await self._refresh_local_ids_from_team(pending["user_id"], message.channel, team)
+
         try:
             await message.add_reaction(TEAM_ANALYSE_EMOJI)
         except discord.HTTPException:
             log.exception("Could not add the team analysis reaction to message %s", message.id)
+
+    async def _refresh_local_ids_from_team(
+        self, user_id: int, channel: Any, team: Dict[str, Any]
+    ) -> None:
+        unresolved: List[str] = []
+        for position in team.get("positions") or []:
+            if position.get("empty"):
+                continue
+            name = str(position.get("name") or "").strip()
+            local_id = position.get("local_id")
+            if not name or local_id is None:
+                continue
+            try:
+                updated = await self._card_store.update_local_id_by_name(
+                    user_id, name, int(local_id), source="team"
+                )
+            except Exception:
+                log.exception(
+                    "Failed updating local_id from team embed: user=%s name=%r local_id=%r",
+                    user_id, name, local_id,
+                )
+                continue
+            if updated is not None:
+                log.info(
+                    "Corrected local_id from team embed: user=%s name=%r -> %s (global_id=%s)",
+                    user_id, name, local_id, updated,
+                )
+            elif not await self._card_store.name_has_unique_active_card(user_id, name):
+                # Not that there was nothing to fix — we genuinely can't
+                # tell which stored card (if any) this name refers to
+                # (zero or multiple active cards share it). Guessing here
+                # is exactly the failure mode this whole fix exists to stop,
+                # so ask the user to resolve it directly instead.
+                unresolved.append(f"{name} [{local_id}]")
+
+        if unresolved:
+            preview = ", ".join(unresolved[:4])
+            if len(unresolved) > 4:
+                preview += f", and {len(unresolved) - 4} more"
+            await self._send_v2_status(
+                channel,
+                f"-# I couldn't confidently match {preview} to a card I've learned. "
+                "Run `.l -name <character>` for each so I can learn it correctly.",
+            )
     async def _bind_removal_prompt(self, message: discord.Message) -> None:
         if not message.embeds or not self._pending_removals[message.channel.id]:
             return
@@ -1896,6 +1993,105 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             return None
         local_ids = [int(value) for value in SKILL_LIST_ID_RE.findall(embed.description or "")]
         return local_ids or None
+
+    @staticmethod
+    def _parse_list_rows(embed: discord.Embed) -> Optional[List[Tuple[str, str, str, str]]]:
+        """Parse a `.l`-shaped embed (any `.l` listing, including a
+        `.l -favorite <emoji>` filtered one — same title/row shape) into
+        (local_id, favorite_emoji, type_symbol, name) tuples. favorite_emoji
+        is "" when that card has no favorite set."""
+        if not SKILL_LIST_TITLE_RE.fullmatch(embed.title or ""):
+            return None
+        rows = LIST_ROW_RE.findall(embed.description or "")
+        return rows or None
+
+    @staticmethod
+    def _resolve_user_by_list_title(message: discord.Message, embed: discord.Embed) -> Optional[int]:
+        """Resolve a `.l` listing's owner from the title's "<username>'s
+        Waifus" prefix — matched against each member's actual Discord
+        username (member.name), never their nickname/display_name, since
+        only the username is guaranteed unique within the guild. Requires
+        the guild's member list to already be cached (no API call is made
+        here); callers should treat None as "couldn't confirm this way",
+        not as "no owner", and fall back accordingly.
+        """
+        if not message.guild:
+            return None
+        m = LIST_TITLE_OWNER_RE.match(embed.title or "")
+        if not m:
+            return None
+        needle = m.group(1).strip().casefold()
+        if not needle:
+            return None
+        matches = [member.id for member in message.guild.members if member.name.casefold() == needle]
+        return matches[0] if len(matches) == 1 else None
+
+    async def _refresh_local_ids_from_anchor_list(
+        self, message: discord.Message, embed: discord.Embed
+    ) -> None:
+        """Self-correct local_ids for any row in a `.l`-shaped embed that's
+        favorited with TIER_ANCHOR_EMOJI, the same way _refresh_local_ids_from_team
+        does for `.team N` embeds — this is the general-purpose version:
+        it fires on ANY `.l` listing (not just one explicitly filtered to
+        the anchor emoji), so a user's regular `.l -orderby skill` browsing
+        also keeps anchored cards fresh as a side effect, and an explicit
+        `.l -favorite 🔺` works as a deliberate "resync everything I've
+        anchored" action.
+
+        A `.l` listing embed carries no per-row ownership info (unlike a
+        `.v` card embed, there's no "Claimed by"), but the title itself
+        does: "<username>'s Waifus (Page N)". That's resolved first, via
+        _resolve_user_by_list_title, matched against actual Discord
+        usernames (unique per guild) rather than nicknames — a stronger
+        signal than timing, since it identifies the owner directly instead
+        of inferring it from which `.l` command happened to run most
+        recently. Falls back to correlating this reply against whoever's
+        `.l` command produced it (_pending_general_list_commands, queued in
+        _observe_user_command) only when the title can't be resolved — e.g.
+        the member isn't in the guild's cache. If NEITHER resolves, this is
+        a silent no-op rather than a guess: guessing wrong would write into
+        the wrong user's SQLite file.
+        """
+        rows = self._parse_list_rows(embed)
+        if not rows or not any(row[1] == TIER_ANCHOR_EMOJI for row in rows):
+            return  # fast path: skip owner resolution entirely if nothing here needs it
+
+        user_id = self._resolve_user_by_list_title(message, embed)
+        if user_id is None:
+            pending = self._pop_recent(self._pending_general_list_commands[message.channel.id])
+            if not pending:
+                return
+            user_id = pending["user_id"]
+        channel = message.channel
+        unresolved: List[str] = []
+        for local_id, favorite, _type_symbol, name in rows:
+            if favorite != TIER_ANCHOR_EMOJI:
+                continue
+            name = name.strip()
+            if not name:
+                continue
+            try:
+                updated = await self._card_store.update_local_id_by_name(
+                    user_id, name, int(local_id), source="anchor_list"
+                )
+            except Exception:
+                log.exception(
+                    "Failed updating local_id from anchor list: user=%s name=%r local_id=%r",
+                    user_id, name, local_id,
+                )
+                continue
+            if updated is None and not await self._card_store.name_has_unique_active_card(user_id, name):
+                unresolved.append(f"{name} [{local_id}]")
+
+        if unresolved:
+            preview = ", ".join(unresolved[:4])
+            if len(unresolved) > 4:
+                preview += f", and {len(unresolved) - 4} more"
+            await self._send_v2_status(
+                channel,
+                f"-# I couldn't confidently match {preview} to a card I've learned. "
+                "Run `.l -name <character>` for each so I can learn it correctly.",
+            )
 
     @staticmethod
     def _scan_batches(local_ids: List[int]) -> List[List[int]]:
@@ -2511,6 +2707,14 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         }
 
         changes = []
+        # Cards being newly suggested for this team (a genuine change, not
+        # "already in this slot") that aren't yet tagged with the anchor
+        # emoji — exactly the moment the person asked for: a card with good
+        # enough stats to be team-worthy, freshly surfaced, not yet tracked.
+        # Only offered once per card in any practical sense: once tagged,
+        # it won't show up here again (the condition is "untagged", which
+        # stops being true the moment they run the suggested `.fav`).
+        untagged_suggestions: List[Tuple[int, str]] = []
 
         for position, card in assignment:
             current = current_slots.get(int(position), {})
@@ -2545,6 +2749,13 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
                 f"`.teamadd {recommended_local_id} "
                 f"{target_team_id} {position}`"
             )
+            if (
+                recommended_local_id is not None
+                and str(card.get("favorite") or "") != TIER_ANCHOR_EMOJI
+            ):
+                untagged_suggestions.append(
+                    (int(recommended_local_id), str(card.get("name") or "Unknown"))
+                )
 
         if changes:
             sections.append(
@@ -2554,6 +2765,26 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         else:
             sections.append(
                 f"### Team {target_team_id} already matches this recommendation."
+            )
+
+        if untagged_suggestions:
+            ids_only = [str(local_id) for local_id, _name in untagged_suggestions]
+            fav_lines = [
+                f"`.fav {' '.join(batch)} {TIER_ANCHOR_EMOJI}`"
+                for batch in (
+                    ids_only[i:i + FAV_COMMAND_BATCH_SIZE]
+                    for i in range(0, len(ids_only), FAV_COMMAND_BATCH_SIZE)
+                )
+            ]
+            names_preview = ", ".join(name for _local_id, name in untagged_suggestions[:5])
+            if len(untagged_suggestions) > 5:
+                names_preview += f", and {len(untagged_suggestions) - 5} more"
+            verb = "is" if len(untagged_suggestions) == 1 else "are"
+            sections.append(
+                "### Tag These For Easier Tracking\n"
+                f"-# {names_preview} {verb} good enough to track — tagging with "
+                f"{TIER_ANCHOR_EMOJI} keeps their local ID accurate even as "
+                "your collection shifts.\n" + "\n".join(fav_lines)
             )
 
         history = await self._quest_history_summary(user_id, quest)
@@ -2814,7 +3045,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             dp = (quest or {}).get("displayed_profit_dp")
         duration_text = self._format_quest_duration(minutes)
         dp_text = f"{int(dp):,} DP" if isinstance(dp, (int, float)) else "? DP"
-        info_line = f"Quest: **{rank}**・Duration: **{duration_text}**・Reward: **{dp_text}**"
+        info_line = f"{rank} · {duration_text} · {dp_text}"
 
         payload: Dict[str, Any] = {
             "flags": V2_FLAG,
@@ -4256,12 +4487,14 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         except Exception:
             return self.DEFAULT_EVENT_ROLE_ID
 
-    async def _wgupdate_send(self, channel: Any, content: str) -> Optional[Tuple[int, int]]:
-        """Send a `wgupdate` status container (A1/A2 shape). Returns
-        (channel_id, message_id) instead of a discord.Message, because V2
-        messages can't be edited through the normal `.edit(content=...)`
-        path — editing one means PATCHing its `components`, not its
-        (nonexistent) `content`. See _wgupdate_edit."""
+    async def _send_v2_status(self, channel: Any, content: str) -> Optional[Tuple[int, int]]:
+        """Send a single-line V2 status container (the `wgupdate`/`wgscan`
+        A1/A2-style shape: one type-17 container holding one type-10 text
+        component). Returns (channel_id, message_id) instead of a
+        discord.Message, because V2 messages can't be edited through the
+        normal `.edit(content=...)` path — editing one means PATCHing its
+        `components`, not its (nonexistent) `content`. See _edit_v2_status.
+        Shared by `wgupdate` and `.wgscan`'s progress/result messages."""
         payload = {
             "flags": V2_FLAG,
             "allowed_mentions": {"parse": []},
@@ -4272,14 +4505,14 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             resp = await self.bot.http.request(route, json=payload)
             return channel.id, int(resp["id"])
         except Exception:
-            log.exception("wgupdate: failed to send status message")
+            log.exception("Failed to send V2 status message")
             return None
 
-    async def _wgupdate_edit(
+    async def _edit_v2_status(
         self, loc: Optional[Tuple[int, int]], channel: Any, content: str
     ) -> Optional[Tuple[int, int]]:
         if loc is None:
-            return await self._wgupdate_send(channel, content)
+            return await self._send_v2_status(channel, content)
         channel_id, message_id = loc
         payload = {
             "allowed_mentions": {"parse": []},
@@ -4293,8 +4526,8 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             await self.bot.http.request(route, json=payload)
             return loc
         except Exception:
-            log.exception("wgupdate: failed to edit status message, sending a new one")
-            return await self._wgupdate_send(channel, content)
+            log.exception("Failed to edit V2 status message, sending a new one")
+            return await self._send_v2_status(channel, content)
 
     async def _reply_or_send(self, message: discord.Message, content: str) -> Optional[discord.Message]:
         try:
@@ -4304,25 +4537,6 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
                 return await message.channel.send(content)
             except Exception:
                 return None
-
-    async def _edit_status_or_send(
-        self,
-        state: Dict[str, Any],
-        channel: Any,
-        content: str,
-    ) -> Optional[discord.Message]:
-        status_message = state.get("status_message")
-        if isinstance(status_message, discord.Message):
-            try:
-                await status_message.edit(content=content)
-                return status_message
-            except Exception:
-                pass
-
-        try:
-            return await channel.send(content)
-        except Exception:
-            return None
 
     async def _get_referenced_message(self, message: discord.Message) -> Optional[discord.Message]:
         ref = message.reference
@@ -4572,6 +4786,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
         series_id = self._parse_completion_series_id(emb)
         if not series_id:
             return
+        series_name = self._series_index.get(series_id, f"Series {series_id}")
         ids, unparsed = self._parse_completion_page(emb)
         # Note: an empty `ids` list is not necessarily a parse failure — a
         # fully-completed series legitimately renders a completion page
@@ -4616,12 +4831,14 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
 
         if has_next:
             self._active_completion_scans[msg.id] = session
-            status_message = await self._edit_status_or_send(
-                session,
-                msg.channel,
-                f"-# Scanning: {len(session['seen_ids'])} found so far, please flip to the next page.",
-            )
-            session["status_message"] = status_message
+            # Sent once, on the first page — the scanning message doesn't
+            # carry a running count, so there's nothing to re-edit on
+            # intermediate pages; it just sits until the final page edits
+            # it into the result (or final-page-wasn't-seen leaves it as is).
+            if session.get("status_message") is None:
+                session["status_message"] = await self._send_v2_status(
+                    msg.channel, f"-# Scanning: `({series_id}) {series_name}`"
+                )
             return
 
         self._active_completion_scans.pop(msg.id, None)
@@ -4641,26 +4858,30 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             added, removed, total = await self._sync_completion_tracking(
                 scanner_user_id, series_id, session["seen_ids"]
             )
-            lines = [f"-# Synced: {total} still missing"]
-            details = []
+            lines = [f"`({series_id}) {series_name}`"]
+            # Added/Removed are each shown only when nonzero — a scan that
+            # only completed characters shouldn't claim "Added: 0", and vice
+            # versa. "Completed" only appears once nothing is left missing.
             if added:
-                details.append(f"{added} newly added")
+                lines.append(f"> -# Added: `{added}`")
             if removed:
-                details.append(f"{removed} obtained elsewhere, removed")
-            if details:
-                lines.append("-# " + ", ".join(details))
-            await self._edit_status_or_send(session, msg.channel, "\n".join(lines))
+                lines.append(f"> -# Removed: `{removed}`")
+            if total == 0:
+                lines.append("> -# **Completed:** `✔️`")
+            if len(lines) == 1:
+                lines.append("> -# No changes.")
+            await self._edit_v2_status(session.get("status_message"), msg.channel, "\n".join(lines))
         else:
             before, after = await self._add_completion_tracking(scanner_user_id, series_id, session["seen_ids"])
             added = after - before
-            lines = [f"-# Stored: {after} IDs"]
+            lines = [f"`({series_id}) {series_name}`", f"> -# Stored: `{after}` IDs"]
             if added:
-                lines.append(f"-# Added: {added} new")
+                lines.append(f"> -# Added: `{added}` new")
             if session.get("suspicious"):
-                lines.append("-# (a page didn't parse as expected, so nothing was removed — this is a bot bug, not your fault)")
+                lines.append("> -# (a page didn't parse as expected, so nothing was removed — this is a bot bug, not your fault)")
             else:
-                lines.append("-# (scan started mid-page, so nothing was removed — reply starting from page 0 for a full sync)")
-            await self._edit_status_or_send(session, msg.channel, "\n".join(lines))
+                lines.append("> -# (scan started mid-page, so nothing was removed — reply starting from page 0 for a full sync)")
+            await self._edit_v2_status(session.get("status_message"), msg.channel, "\n".join(lines))
 
     # ------------------------------------------------------------
     # Series update from .sc embed
@@ -4718,7 +4939,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             await self._finish_series_update(target_message)
             return
 
-        status_loc = await self._wgupdate_send(
+        status_loc = await self._send_v2_status(
             trigger_message.channel,
             f"-# Scanning: `({series_id}) {series_name}`\n",
         )
@@ -4757,7 +4978,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             if missing:
                 if not state.get("notified_missing"):
                     state["notified_missing"] = True
-                    status_loc = await self._wgupdate_edit(
+                    status_loc = await self._edit_v2_status(
                         state.get("status_message"),
                         message.channel,
                         "-# Missing pages: `" + ", ".join(str(i) for i in missing) + "`.",
@@ -4790,7 +5011,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             # that's an incomplete/failed result, not a legitimate
             # zero-change update. Report it as a failure, not as "Updated"
             # with all-zero counts, so the two are never confused.
-            await self._wgupdate_edit(
+            await self._edit_v2_status(
                 state.get("status_message"), message.channel,
                 f"-# Failed: `({series_id}) {series_name}`\n-# No characters were found in the scanned page(s).",
             )
@@ -4805,7 +5026,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             )
         except Exception:
             log.exception("wgupdate: catalog refresh failed for series %s", series_id)
-            await self._wgupdate_edit(
+            await self._edit_v2_status(
                 state.get("status_message"), message.channel,
                 f"-# Failed: `({series_id}) {series_name}`\n-# The catalog refresh raised an error — see logs.",
             )
@@ -4817,7 +5038,7 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
             f"> -# Removed: `{removed}`\n"
             f"> -# Modified: `{modified}`"
         )
-        await self._wgupdate_edit(state.get("status_message"), message.channel, content)
+        await self._edit_v2_status(state.get("status_message"), message.channel, content)
 
     # ------------------------------------------------------------
     # DM helpers
@@ -6471,4 +6692,3 @@ class Waifugami(AuditMixin, CatalogMixin, DupesMixin, TrackingUIMixin, commands.
     async def wg_audit_status(self, ctx: commands.Context) -> None:
         """Show current audit session state."""
         await self.wgaudit_status.callback(self, ctx)
-
